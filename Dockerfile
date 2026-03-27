@@ -12,9 +12,9 @@ COPY models/ ./models/
 
 # Runtime configuration — override at docker run / compose time as needed
 ENV MODEL_PATH=/app/models/lstm_ae_best.pth \
-    INPUT_DIM=1 \
+    INPUT_DIM=25 \
     HIDDEN_DIM=64 \
-    NUM_LAYERS=2 \
+    NUM_LAYERS=1 \
     THRESHOLD=0.05
 
 EXPOSE 8000

@@ -12,3 +12,9 @@ mlruns/
 *.zip
 telemanom/
 download_data.py
+find_best_channel.py
+INTERVIEW_NOTES.txt
+src/mlflow.db
+src/__pycache__/
+mlruns/
+*.db

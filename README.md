@@ -38,6 +38,27 @@ LSTM-AE achieves **zero false positives** (Precision=1.0) while catching 68.7% o
 
 ---
 
+## Project Structure
+
+```
+anomaly-detection/
+├── src/
+│   ├── dataset.py        # Data loading, StandardScaler, sliding windows
+│   ├── model.py          # LSTMAutoencoder + Isolation Forest baseline
+│   ├── train.py          # Training pipeline, MLflow logging, evaluation plots
+│   └── api.py            # FastAPI REST API (/predict, /health, /info)
+├── notebooks/
+│   └── AnomalyDetection_Colab.ipynb  # End-to-end notebook with ONNX export
+├── models/               # Saved model checkpoint (.pth)
+├── outputs/              # Generated plots and results.json
+├── data/                 # SMAP .npy files (not committed)
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
+```
+
+---
+
 ## Quick Start
 
 ```bash
@@ -76,7 +97,7 @@ curl http://localhost:8000/health
 curl -X POST http://localhost:8000/predict \
   -H "Content-Type: application/json" \
   -d '{
-    "window": [[0.12], [0.15], [0.11], [-0.02], [0.08]],
+    "window": [[0.12, 0.05, -0.3, 0.1, 0.22, 0.0, -0.1, 0.3, 0.15, 0.07, 0.02, -0.05, 0.11, 0.08, -0.2, 0.14, 0.09, 0.01, -0.07, 0.18, 0.06, -0.12, 0.03, 0.21, -0.04]],
     "threshold": 0.05
   }'
 ```
@@ -99,7 +120,7 @@ Interactive API docs (Swagger UI) are available at `http://localhost:8000/docs` 
 | Decision | Rationale |
 |---|---|
 | **Window stride = 1** | Maximises training samples from limited labelled data; SMAP train splits have ~2–8 k steps per channel. |
-| **Gradient clipping `max_norm=1.0`** | BPTT through 128 time-steps can cause exploding gradients in LSTMs. Clipping the norm caps the update magnitude without eliminating gradient signal. |
+| **Gradient clipping `max_norm=1.0`** | BPTT through many time-steps can cause exploding gradients in LSTMs. Clipping the norm caps the update magnitude without eliminating gradient signal. |
 | **`ReduceLROnPlateau` scheduler** | Automatically halves the learning rate when validation loss plateaus (patience=5), avoiding manual LR tuning and helping converge to a better optimum. |
 | **MLflow experiment tracking** | Every training run logs hyperparameters, per-epoch train/val loss, and the best checkpoint as an artefact. This enables A/B comparisons between configurations (hidden_dim, num_layers, lr) without relying on manual notes. |
 | **Point-adjust max-pooling** | Maps window scores to per-step scores by taking the MAX over all windows containing a step. This is the standard convention in the SMAP/MSL literature (Hundman et al. 2018) and is conservative: a single high-error window is enough to flag a time-step. |

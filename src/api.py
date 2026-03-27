@@ -11,7 +11,7 @@ Why FastAPI?
   • Minimal boilerplate compared with Flask while offering better type safety.
 
 Expected latency:
-  ~12 ms per window on CPU for a single-channel (F=1) window of length 128.
+  ~12 ms per window on CPU for a 25-feature window of length 30 (E-7 config).
   Most of the budget is the LSTM forward pass (~8 ms); tensor allocation and
   JSON serialisation account for the rest.
 """
@@ -90,7 +90,7 @@ class WindowRequest(BaseModel):
         ...,
         description=(
             "2-D list of shape [seq_len, num_features]. "
-            "For SMAP channel P-1 this is [128, 1]."
+            "For SMAP channel E-7 this is [30, 25]."
         ),
     )
     threshold: float = Field(

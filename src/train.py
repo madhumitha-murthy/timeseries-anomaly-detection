@@ -35,14 +35,14 @@ from model import LSTMAutoencoder, isolation_forest_errors, reconstruction_error
 # ---------------------------------------------------------------------------
 
 CONFIG = {
-    "channel": "P-1",
+    "channel": "E-7",
     "data_dir": "../data",
     "hidden_dim": 64,
-    "num_layers": 2,
-    "dropout": 0.2,
-    "window_size": 128,
-    "batch_size": 64,
-    "num_epochs": 50,
+    "num_layers": 1,
+    "dropout": 0.0,
+    "window_size": 30,
+    "batch_size": 32,
+    "num_epochs": 200,
     "lr": 1e-3,
     "weight_decay": 1e-5,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
