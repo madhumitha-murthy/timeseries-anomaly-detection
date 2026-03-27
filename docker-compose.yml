@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  api:
+    build:
+      context: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount trained model so it persists outside the container
+      - ./models:/app/models
+      # Mount outputs so plots / results are accessible on the host
+      - ./outputs:/app/outputs
+    environment:
+      THRESHOLD: "0.05"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
