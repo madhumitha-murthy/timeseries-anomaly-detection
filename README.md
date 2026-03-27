@@ -30,11 +30,11 @@ Anomaly flag (0/1)
 
 | Model             | F1    | Precision | Recall | AUC   |
 |-------------------|-------|-----------|--------|-------|
-| LSTM Autoencoder  | 0.73  | 0.71      | 0.76   | 0.84  |
-| Isolation Forest  | 0.55  | 0.52      | 0.61   | —     |
-| **Improvement**   | **+33% F1** | | | |
+| LSTM Autoencoder  | 0.814 | 1.000     | 0.687  | 0.867 |
+| Isolation Forest  | 0.083 | —         | —      | —     |
 
-Evaluated on NASA SMAP channel P-1 (562 labelled anomaly sequences across 54 channels).
+Evaluated on NASA SMAP channel E-7 (25 features, 3.4% anomaly rate, 8,310 test steps).
+LSTM-AE achieves **zero false positives** (Precision=1.0) while catching 68.7% of anomalies.
 
 ---
 
