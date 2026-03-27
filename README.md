@@ -36,6 +36,12 @@ Anomaly flag (0/1)
 Evaluated on NASA SMAP channel E-7 (25 features, 3.4% anomaly rate, 8,310 test steps).
 LSTM-AE achieves **zero false positives** (Precision=1.0) while catching 68.7% of anomalies.
 
+### Anomaly Detection Plot
+![Anomaly Detection Results](assets/anomaly_results.png)
+
+### Training Loss Curve
+![Training Loss](assets/loss_curve.png)
+
 ---
 
 ## Project Structure
