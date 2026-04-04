@@ -10,12 +10,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 COPY models/ ./models/
 
-# Runtime configuration — override at docker run / compose time as needed
+# Runtime configuration — override at docker run / compose time as needed.
+# THRESHOLD is intentionally omitted: the API reads the value from
+# threshold.json (saved by train.py) at startup.  Only set THRESHOLD here
+# if you need to manually override the trained value.
 ENV MODEL_PATH=/app/models/lstm_ae_best.pth \
+    THRESHOLD_PATH=/app/models/threshold.json \
     INPUT_DIM=25 \
     HIDDEN_DIM=64 \
     NUM_LAYERS=1 \
-    THRESHOLD=0.05
+    WINDOW_SIZE=30
 
 EXPOSE 8000
 

@@ -1,0 +1,25 @@
+# LSTM Autoencoder — training configuration
+#
+# Run with defaults:
+#   cd src && python train.py
+#
+# Override individual values from CLI:
+#   cd src && python train.py --channel P-1 --num_epochs 50
+#
+# Use a different config file entirely:
+#   cd src && python train.py --config ../configs/experiment_2.yaml
+#
+# Note: 'device' is intentionally absent — always auto-detected from CUDA availability.
+
+channel:      E-7
+data_dir:     ../data
+hidden_dim:   64
+num_layers:   1
+dropout:      0.0
+window_size:  30
+batch_size:   32
+num_epochs:   200
+lr:           0.001
+weight_decay: 0.00001
+save_path:    ../models/lstm_ae_best.pth
+out_dir:      ../outputs/

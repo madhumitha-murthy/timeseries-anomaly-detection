@@ -172,6 +172,7 @@ def reconstruction_errors(
 def isolation_forest_errors(
     train_windows: np.ndarray,
     test_windows: np.ndarray,
+    contamination: float = 0.1,
 ) -> np.ndarray:
     """Baseline anomaly scores using Isolation Forest.
 
@@ -184,6 +185,11 @@ def isolation_forest_errors(
     ----------
     train_windows : np.ndarray, shape (N_train, W, F)
     test_windows  : np.ndarray, shape (N_test,  W, F)
+    contamination : float
+        Expected proportion of anomalies in the test set.  Pass the actual
+        anomaly rate from the labels (``labels.mean()``) so IsolationForest is
+        calibrated to the true class balance — not the default 10% which over-
+        flags when anomalies are rare.
 
     Returns
     -------
@@ -198,7 +204,7 @@ def isolation_forest_errors(
 
     clf = IsolationForest(
         n_estimators=100,
-        contamination="auto",
+        contamination=float(np.clip(contamination, 1e-3, 0.5)),
         random_state=42,
         n_jobs=-1,
     )

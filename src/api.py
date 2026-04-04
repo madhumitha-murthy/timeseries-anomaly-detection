@@ -16,26 +16,47 @@ Expected latency:
   JSON serialisation account for the rest.
 """
 
+import json
+import logging
 import os
 import time
 from typing import List
 
+import numpy as np
 import torch
-import torch.nn as nn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from model import LSTMAutoencoder
 
 # ---------------------------------------------------------------------------
+# Structured logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
 # Configuration (override via environment variables at runtime)
 # ---------------------------------------------------------------------------
 
-MODEL_PATH = os.getenv("MODEL_PATH", "../models/lstm_ae_best.pth")
-INPUT_DIM = int(os.getenv("INPUT_DIM", "1"))
-HIDDEN_DIM = int(os.getenv("HIDDEN_DIM", "64"))
-NUM_LAYERS = int(os.getenv("NUM_LAYERS", "2"))
-DEFAULT_THRESHOLD = float(os.getenv("THRESHOLD", "0.05"))
+MODEL_PATH     = os.getenv("MODEL_PATH",     "../models/lstm_ae_best.pth")
+THRESHOLD_PATH = os.getenv("THRESHOLD_PATH", "../models/threshold.json")
+INPUT_DIM      = int(os.getenv("INPUT_DIM",  "1"))
+HIDDEN_DIM     = int(os.getenv("HIDDEN_DIM", "64"))
+NUM_LAYERS     = int(os.getenv("NUM_LAYERS", "1"))
+# WINDOW_SIZE=0 means "do not validate seq_len" (backwards-compatible default).
+# Set to the training window size (e.g. 30) to reject windows of wrong length.
+WINDOW_SIZE    = int(os.getenv("WINDOW_SIZE", "0"))
+
+# Threshold loaded from saved file at startup; env var is a manual override only.
+# Previously hardcoded to 0.05 while the actual trained threshold was ~6.99,
+# meaning every window would have been flagged as anomalous.
+_THRESHOLD_ENV_OVERRIDE = os.getenv("THRESHOLD")  # None if not set
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -47,19 +68,23 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Global model reference populated at startup
+# Global state populated at startup
 _model: LSTMAutoencoder = None
 _device: torch.device = None
+_default_threshold: float = 0.05  # overwritten at startup from threshold.json
 
 
 @app.on_event("startup")
 def load_model():
-    """Load the trained LSTM Autoencoder once when the server starts.
+    """Load model weights and deployment threshold once when the server starts.
 
-    Using a startup event ensures the model is loaded exactly once, shared
-    across all requests, and ready before the first request arrives.
+    Threshold is read from the JSON file saved by train.py (99th percentile of
+    training reconstruction errors).  This ensures the API uses the same
+    threshold that was derived from the training distribution — not an
+    arbitrary hardcoded value.  An explicit THRESHOLD env var still takes
+    precedence for manual overrides.
     """
-    global _model, _device
+    global _model, _device, _default_threshold
     _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     _model = LSTMAutoencoder(
@@ -72,11 +97,27 @@ def load_model():
     if os.path.exists(MODEL_PATH):
         state = torch.load(MODEL_PATH, map_location=_device)
         _model.load_state_dict(state)
-        print(f"[startup] Loaded model weights from {MODEL_PATH}")
+        logger.info("Loaded model weights from %s", MODEL_PATH)
     else:
-        print(f"[startup] WARNING — model file not found at {MODEL_PATH}. Serving with random weights.")
+        logger.warning("Model file not found at %s — serving with random weights", MODEL_PATH)
 
     _model.eval()
+
+    # Load threshold — prefer saved file, fall back to env var
+    if _THRESHOLD_ENV_OVERRIDE is not None:
+        _default_threshold = float(_THRESHOLD_ENV_OVERRIDE)
+        logger.info("Threshold set from env var: %s", _default_threshold)
+    elif os.path.exists(THRESHOLD_PATH):
+        with open(THRESHOLD_PATH) as fh:
+            _default_threshold = float(json.load(fh)["threshold"])
+        logger.info("Threshold loaded from %s: %.6f", THRESHOLD_PATH, _default_threshold)
+    else:
+        logger.warning(
+            "Threshold file not found at %s — using fallback %.4f. "
+            "Re-run train.py to generate threshold.json.",
+            THRESHOLD_PATH,
+            _default_threshold,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -94,9 +135,15 @@ class WindowRequest(BaseModel):
         ),
     )
     threshold: float = Field(
-        default=DEFAULT_THRESHOLD,
-        description="Anomaly score threshold above which is_anomaly=True.",
+        default=None,
+        description=(
+            "Anomaly score threshold above which is_anomaly=True. "
+            "Defaults to the deployment threshold loaded from threshold.json."
+        ),
     )
+
+    def resolved_threshold(self) -> float:
+        return self.threshold if self.threshold is not None else _default_threshold
 
 
 class AnomalyResponse(BaseModel):
@@ -114,8 +161,24 @@ class AnomalyResponse(BaseModel):
 
 @app.get("/health", tags=["Ops"])
 def health():
-    """Liveness probe — returns 200 OK when the server is running."""
-    return {"status": "ok"}
+    """Readiness probe — returns 200 only when the server is fully ready.
+
+    Checks that the model is loaded and a valid threshold is configured.
+    Returns 503 if either condition is not met so load balancers and
+    Kubernetes readiness probes do not route traffic to a broken instance.
+    """
+    if _model is None:
+        logger.error("Health check failed: model not loaded")
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if _default_threshold <= 0:
+        logger.error("Health check failed: threshold not configured (value=%.4f)", _default_threshold)
+        raise HTTPException(status_code=503, detail="Threshold not configured")
+    return {
+        "status": "ok",
+        "model_loaded": True,
+        "threshold": _default_threshold,
+        "device": str(_device),
+    }
 
 
 @app.get("/info", tags=["Ops"])
@@ -127,7 +190,8 @@ def info():
         "input_dim": INPUT_DIM,
         "hidden_dim": HIDDEN_DIM,
         "num_layers": NUM_LAYERS,
-        "default_threshold": DEFAULT_THRESHOLD,
+        "default_threshold": _default_threshold,
+        "threshold_source": THRESHOLD_PATH if os.path.exists(THRESHOLD_PATH) else "fallback",
         "model_path": MODEL_PATH,
     }
 
@@ -155,8 +219,13 @@ def predict(request: WindowRequest) -> AnomalyResponse:
             detail=f"Expected {INPUT_DIM} feature(s) per step, got {n_features}.",
         )
 
+    if WINDOW_SIZE > 0 and seq_len != WINDOW_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected seq_len={WINDOW_SIZE} (model training window size), got {seq_len}.",
+        )
+
     # --- Build tensor: (1, seq_len, features) ---
-    import numpy as np  # local import to keep startup fast
     x = torch.tensor(np.array(window, dtype=np.float32)).unsqueeze(0).to(_device)  # (1, W, F)
 
     # --- Inference ---
@@ -164,21 +233,72 @@ def predict(request: WindowRequest) -> AnomalyResponse:
         recon, _ = _model(x)
         mse = float(((recon - x) ** 2).mean().item())
 
+    threshold = request.resolved_threshold()
     latency_ms = (time.perf_counter() - t_start) * 1000.0
 
     return AnomalyResponse(
         anomaly_score=round(mse, 6),
-        is_anomaly=mse >= request.threshold,
-        threshold_used=request.threshold,
+        is_anomaly=mse >= threshold,
+        threshold_used=threshold,
         latency_ms=round(latency_ms, 3),
     )
 
 
 @app.post("/predict/batch", response_model=List[AnomalyResponse], tags=["Inference"])
 def predict_batch(requests: List[WindowRequest]) -> List[AnomalyResponse]:
-    """Score a batch of time-series windows.
+    """Score a batch of time-series windows in a single forward pass.
 
-    Processes each window independently and returns a list of
-    :class:`AnomalyResponse` objects in the same order.
+    Stacks all windows into one tensor (B, W, F) and runs one LSTM forward
+    pass — significantly faster than calling /predict N times in a loop
+    (previously that was the implementation, making the batch endpoint a
+    performance anti-pattern rather than an optimisation).
     """
-    return [predict(req) for req in requests]
+    if not requests:
+        return []
+
+    t_start = time.perf_counter()
+
+    # Validate shape for all windows before touching the model
+    for i, req in enumerate(requests):
+        if not req.window or not isinstance(req.window[0], list):
+            raise HTTPException(status_code=400, detail=f"Request {i}: window must be a 2-D list.")
+        n_features = len(req.window[0])
+        if n_features != INPUT_DIM:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Request {i}: expected {INPUT_DIM} feature(s), got {n_features}.",
+            )
+        if WINDOW_SIZE > 0 and len(req.window) != WINDOW_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Request {i}: expected seq_len={WINDOW_SIZE}, got {len(req.window)}.",
+            )
+
+    # Stack into a single batch tensor — requires all windows to have the same seq_len
+    try:
+        windows_np = np.stack([np.array(req.window, dtype=np.float32) for req in requests])
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"All windows must have the same seq_len for batch inference: {exc}",
+        )
+
+    x = torch.tensor(windows_np).to(_device)  # (B, W, F)
+
+    # Single forward pass for the entire batch
+    with torch.no_grad():
+        recon, _ = _model(x)
+        mses = ((recon - x) ** 2).mean(dim=(1, 2)).cpu().tolist()  # (B,)
+
+    total_latency_ms = (time.perf_counter() - t_start) * 1000.0
+    per_window_ms = round(total_latency_ms / len(requests), 3)
+
+    return [
+        AnomalyResponse(
+            anomaly_score=round(mse, 6),
+            is_anomaly=mse >= req.resolved_threshold(),
+            threshold_used=req.resolved_threshold(),
+            latency_ms=per_window_ms,
+        )
+        for mse, req in zip(mses, requests)
+    ]

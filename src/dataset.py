@@ -28,7 +28,6 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
 WINDOW_SIZE = 128
-STRIDE = 1
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +72,27 @@ def load_channel(channel: str, data_dir: str = "../data"):
     return train_data, test_data, scaler
 
 
+def train_val_split(train_data: np.ndarray, val_frac: float = 0.2):
+    """Split normalised training data into train and validation portions.
+
+    Uses a time-ordered (non-shuffled) split so earlier timesteps train the
+    model and later timesteps validate it — preserving temporal structure.
+    Safe to split freely because SMAP training data is anomaly-free.
+
+    Parameters
+    ----------
+    train_data : np.ndarray, shape (T, F)
+    val_frac   : float  Fraction of T reserved for validation (default 0.2).
+
+    Returns
+    -------
+    train_split : np.ndarray, shape (T * (1 - val_frac), F)
+    val_split   : np.ndarray, shape (T * val_frac, F)
+    """
+    split = int(len(train_data) * (1 - val_frac))
+    return train_data[:split], train_data[split:]
+
+
 def load_labels(channel: str, test_length: int, data_dir: str = "../data") -> np.ndarray:
     """Build a binary anomaly label array for the test split.
 
@@ -115,7 +135,7 @@ def load_labels(channel: str, test_length: int, data_dir: str = "../data") -> np
 # Windowing
 # ---------------------------------------------------------------------------
 
-def make_windows(data: np.ndarray, window_size: int = WINDOW_SIZE, stride: int = STRIDE) -> np.ndarray:
+def make_windows(data: np.ndarray, window_size: int = WINDOW_SIZE, stride: int = 1) -> np.ndarray:
     """Create overlapping sliding windows from a time series.
 
     Parameters
@@ -132,9 +152,14 @@ def make_windows(data: np.ndarray, window_size: int = WINDOW_SIZE, stride: int =
     T, F = data.shape
     n_windows = (T - window_size) // stride + 1
     windows = np.lib.stride_tricks.sliding_window_view(data, window_shape=(window_size, F))
-    # sliding_window_view returns shape (n_windows, 1, window_size, F) — squeeze axis 1
-    windows = windows[:n_windows:stride].reshape(n_windows, window_size, F)
-    return windows.astype(np.float32)
+    # sliding_window_view returns shape (T-W+1, 1, W, F) — all stride-1 windows.
+    # Apply stride by stepping through axis 0, then squeeze the size-1 axis.
+    # Bug fix: the original `windows[:n_windows:stride]` applied stride AND capped
+    # to n_windows simultaneously, slicing only n_windows/stride items then
+    # failing to reshape them back to n_windows.  Correct approach: step first,
+    # then trim to the exact window count.
+    windows = windows[::stride, 0]   # (≥n_windows, W, F)
+    return windows[:n_windows].astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +217,7 @@ def get_dataloaders(
     train_windows : np.ndarray, shape (N_train, W, F)
     test_windows  : np.ndarray, shape (N_test,  W, F)
     """
-    train_windows = make_windows(train_data, window_size, stride=STRIDE)
+    train_windows = make_windows(train_data, window_size, stride=1)
     test_windows = make_windows(test_data, window_size, stride=1)
 
     train_ds = TimeSeriesDataset(train_windows)

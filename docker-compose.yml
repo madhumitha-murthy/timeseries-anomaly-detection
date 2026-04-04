@@ -11,8 +11,10 @@ services:
       - ./models:/app/models
       # Mount outputs so plots / results are accessible on the host
       - ./outputs:/app/outputs
-    environment:
-      THRESHOLD: "0.05"
+    # THRESHOLD is loaded automatically from models/threshold.json at startup.
+    # Uncomment and set manually only if you need to override the trained value.
+    # environment:
+    #   THRESHOLD: "6.992002"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s

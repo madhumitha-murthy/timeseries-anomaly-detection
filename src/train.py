@@ -2,12 +2,15 @@
 train.py — Full training pipeline for LSTM Autoencoder on NASA SMAP dataset.
 
 Usage:
-    python train.py
+    cd src && python train.py
+    cd src && python train.py --channel P-1 --num_epochs 50
+    cd src && python train.py --config ../configs/experiment_2.yaml
 
-Expects the SMAP data under CONFIG["data_dir"] with sub-folders train/ and test/
+Expects the SMAP data under data_dir with sub-folders train/ and test/
 and the file labeled_anomalies.csv.
 """
 
+import argparse
 import json
 import os
 import time
@@ -20,35 +23,121 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import yaml
 from sklearn.metrics import (
+    average_precision_score,
+    confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
     roc_auc_score,
 )
 
-from dataset import get_dataloaders, load_channel, load_labels
+from dataset import get_dataloaders, load_channel, load_labels, train_val_split
 from model import LSTMAutoencoder, isolation_forest_errors, reconstruction_errors
 
 # ---------------------------------------------------------------------------
-# Global configuration
+# Configuration helpers
 # ---------------------------------------------------------------------------
 
-CONFIG = {
-    "channel": "E-7",
-    "data_dir": "../data",
-    "hidden_dim": 64,
-    "num_layers": 1,
-    "dropout": 0.0,
-    "window_size": 30,
-    "batch_size": 32,
-    "num_epochs": 200,
-    "lr": 1e-3,
+_DEFAULTS = {
+    "channel":      "E-7",
+    "data_dir":     "../data",
+    "hidden_dim":   64,
+    "num_layers":   1,
+    "dropout":      0.0,
+    "window_size":  30,
+    "batch_size":   32,
+    "num_epochs":   200,
+    "lr":           1e-3,
     "weight_decay": 1e-5,
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "save_path": "../models/lstm_ae_best.pth",
-    "out_dir": "../outputs/",
+    "save_path":    "../models/lstm_ae_best.pth",
+    "out_dir":      "../outputs/",
 }
+
+
+def load_config(config_path: str = None, **overrides) -> dict:
+    """Load configuration from a YAML file and apply CLI overrides.
+
+    Priority (highest → lowest): CLI overrides > YAML file > built-in defaults.
+
+    Parameters
+    ----------
+    config_path : str or None
+        Path to a YAML config file.  If None, only defaults + overrides are used.
+    **overrides
+        Key/value pairs from argparse (only non-None values override the file).
+
+    Returns
+    -------
+    cfg : dict  Complete configuration ready for use in main().
+    """
+    cfg = dict(_DEFAULTS)
+
+    if config_path is not None:
+        with open(config_path) as fh:
+            file_cfg = yaml.safe_load(fh) or {}
+        cfg.update(file_cfg)
+
+    # Apply explicit CLI overrides (skip None so argparse defaults don't shadow file values)
+    for key, value in overrides.items():
+        if value is not None:
+            cfg[key] = value
+
+    # device is always auto-detected — never read from file or CLI
+    cfg["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+
+    return cfg
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    p = argparse.ArgumentParser(
+        description="Train LSTM Autoencoder for anomaly detection on NASA SMAP data.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--config",       type=str,   default=None,  help="Path to YAML config file (overrides built-in defaults)")
+    p.add_argument("--channel",      type=str,   default=None,  help="SMAP channel ID, e.g. E-7")
+    p.add_argument("--data_dir",     type=str,   default=None,  help="Root data directory")
+    p.add_argument("--hidden_dim",   type=int,   default=None,  help="LSTM hidden units")
+    p.add_argument("--num_layers",   type=int,   default=None,  help="Number of LSTM layers")
+    p.add_argument("--dropout",      type=float, default=None,  help="LSTM dropout probability")
+    p.add_argument("--window_size",  type=int,   default=None,  help="Sliding window length")
+    p.add_argument("--batch_size",   type=int,   default=None,  help="Mini-batch size")
+    p.add_argument("--num_epochs",   type=int,   default=None,  help="Maximum training epochs")
+    p.add_argument("--lr",           type=float, default=None,  help="Adam learning rate")
+    p.add_argument("--weight_decay", type=float, default=None,  help="Adam weight decay")
+    p.add_argument("--save_path",    type=str,   default=None,  help="Path to save best model checkpoint")
+    p.add_argument("--out_dir",      type=str,   default=None,  help="Directory for plots and results.json")
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Early stopping
+# ---------------------------------------------------------------------------
+
+class EarlyStopping:
+    """Stops training when validation loss stops improving.
+
+    Prevents the ~70 wasted epochs seen in Run 4 where val loss was flat from
+    epoch 130 onward. patience=15 gives the scheduler room to reduce LR and
+    recover before stopping.
+    """
+
+    def __init__(self, patience: int = 15, min_delta: float = 1e-5):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = float("inf")
+
+    def step(self, val_loss: float) -> bool:
+        """Return True if training should stop."""
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+        return self.counter >= self.patience
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +219,83 @@ def find_best_threshold(
             best_predictions = preds
 
     return best_threshold, best_f1, best_predictions
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def compute_metrics(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    preds: np.ndarray,
+    threshold: float,
+) -> dict:
+    """Compute the full evaluation metric suite for one model/threshold combo.
+
+    Parameters
+    ----------
+    scores    : continuous anomaly scores, shape (T,)
+    labels    : binary ground-truth, shape (T,)
+    preds     : binary predictions at threshold, shape (T,)
+    threshold : the threshold used to produce preds
+
+    Returns
+    -------
+    dict with keys: f1, precision, recall, auc_roc, avg_precision,
+                    false_alarm_rate, detection_delay_steps, threshold
+    """
+    f1   = f1_score(labels, preds, zero_division=0)
+    prec = precision_score(labels, preds, zero_division=0)
+    rec  = recall_score(labels, preds, zero_division=0)
+
+    try:
+        auc_roc = roc_auc_score(labels, scores)
+    except ValueError:
+        auc_roc = float("nan")
+
+    try:
+        avg_prec = average_precision_score(labels, scores)
+    except ValueError:
+        avg_prec = float("nan")
+
+    # False Alarm Rate — FP / (FP + TN) — fraction of normal steps wrongly flagged.
+    # Critical in manufacturing: every false alarm is a potential unplanned downtime.
+    tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+    false_alarm_rate = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+
+    # Detection Delay — median number of steps between the START of each anomaly
+    # segment and the first prediction of 1 within that segment.
+    # Lower = earlier warning = more time to act before failure.
+    detection_delays = []
+    in_anomaly = False
+    seg_start = 0
+    for i in range(len(labels)):
+        if labels[i] == 1 and not in_anomaly:
+            seg_start = i
+            in_anomaly = True
+        elif (labels[i] == 0 or i == len(labels) - 1) and in_anomaly:
+            seg_end = i if labels[i] == 0 else i + 1
+            seg_preds = preds[seg_start:seg_end]
+            flagged = np.where(seg_preds == 1)[0]
+            if len(flagged) > 0:
+                detection_delays.append(int(flagged[0]))  # steps into segment
+            else:
+                detection_delays.append(seg_end - seg_start)  # missed = full length
+            in_anomaly = False
+
+    detection_delay = float(np.median(detection_delays)) if detection_delays else None
+
+    return {
+        "threshold":             round(float(threshold), 6),
+        "f1":                    round(float(f1), 4),
+        "precision":             round(float(prec), 4),
+        "recall":                round(float(rec), 4),
+        "auc_roc":               round(float(auc_roc), 4) if auc_roc is not None and not np.isnan(auc_roc) else None,
+        "avg_precision":         round(float(avg_prec), 4) if avg_prec is not None and not np.isnan(avg_prec) else None,
+        "false_alarm_rate":      round(float(false_alarm_rate), 4),
+        "detection_delay_steps": round(detection_delay, 1) if detection_delay is not None else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -268,27 +434,76 @@ def plot_loss_curve(train_history, val_history, out_dir):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    device = torch.device(CONFIG["device"])
+def main(config: dict = None):
+    """Run the full training and evaluation pipeline.
+
+    Parameters
+    ----------
+    config : dict or None
+        Pre-built configuration dict (e.g., from a notebook).  When None,
+        configuration is loaded from CLI arguments and/or a YAML file.
+    """
+    if config is None:
+        args = parse_args()
+        cfg = load_config(
+            config_path=args.config,
+            channel=args.channel,
+            data_dir=args.data_dir,
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            window_size=args.window_size,
+            batch_size=args.batch_size,
+            num_epochs=args.num_epochs,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            save_path=args.save_path,
+            out_dir=args.out_dir,
+        )
+    else:
+        cfg = dict(_DEFAULTS)
+        cfg.update(config)
+        cfg["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+
+    device = torch.device(cfg["device"])
     print(f"Device: {device}")
 
     # ------------------------------------------------------------------
     # 1. Load data
     # ------------------------------------------------------------------
-    train_data, test_data, _ = load_channel(CONFIG["channel"], CONFIG["data_dir"])
-    labels = load_labels(CONFIG["channel"], len(test_data), CONFIG["data_dir"])
+    train_data, test_data, _ = load_channel(cfg["channel"], cfg["data_dir"])
+    labels = load_labels(cfg["channel"], len(test_data), cfg["data_dir"])
 
-    anomaly_rate = labels.mean() * 100
+    anomaly_rate = labels.mean()
     print(f"Train size : {len(train_data):,} steps")
-    print(f"Test  size : {len(test_data):,} steps  |  Anomaly rate: {anomaly_rate:.2f}%")
+    print(f"Test  size : {len(test_data):,} steps  |  Anomaly rate: {anomaly_rate * 100:.2f}%")
 
-    train_loader, test_loader, train_windows, test_windows = get_dataloaders(
-        train_data,
-        test_data,
-        window_size=CONFIG["window_size"],
-        batch_size=CONFIG["batch_size"],
+    # Split train into train/val (80/20, time-ordered).
+    # Val comes from the same anomaly-free training distribution — no leakage.
+    # Previously val_epoch used the test set, meaning the saved checkpoint was
+    # selected using test data — a form of leakage.
+    train_split, val_split = train_val_split(train_data, val_frac=0.2)
+
+    train_loader, val_loader, train_windows, _ = get_dataloaders(
+        train_split,
+        val_split,
+        window_size=cfg["window_size"],
+        batch_size=cfg["batch_size"],
     )
-    print(f"Train windows: {len(train_windows):,}  |  Test windows: {len(test_windows):,}")
+
+    # Separate test loader — never touched during training or checkpoint selection.
+    _, test_loader, _, test_windows = get_dataloaders(
+        train_split,
+        test_data,
+        window_size=cfg["window_size"],
+        batch_size=cfg["batch_size"],
+    )
+
+    print(
+        f"Train windows: {len(train_windows):,}  |  "
+        f"Val windows: {len(val_loader.dataset):,}  |  "
+        f"Test windows: {len(test_windows):,}"
+    )
 
     input_dim = train_data.shape[1]
 
@@ -297,16 +512,16 @@ def main():
     # ------------------------------------------------------------------
     model = LSTMAutoencoder(
         input_dim=input_dim,
-        hidden_dim=CONFIG["hidden_dim"],
-        num_layers=CONFIG["num_layers"],
-        dropout=CONFIG["dropout"],
+        hidden_dim=cfg["hidden_dim"],
+        num_layers=cfg["num_layers"],
+        dropout=cfg["dropout"],
     ).to(device)
 
     criterion = nn.MSELoss()
     optimizer = optim.Adam(
         model.parameters(),
-        lr=CONFIG["lr"],
-        weight_decay=CONFIG["weight_decay"],
+        lr=cfg["lr"],
+        weight_decay=cfg["weight_decay"],
     )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=5, factor=0.5
@@ -324,20 +539,23 @@ def main():
 
     metrics_log = {"train_loss": [], "val_loss": []}
     best_val_loss = float("inf")
-    os.makedirs(os.path.dirname(CONFIG["save_path"]), exist_ok=True)
+    os.makedirs(os.path.dirname(cfg["save_path"]), exist_ok=True)
+
+    early_stopper = EarlyStopping(patience=15, min_delta=1e-5)
 
     if mlflow_available:
         mlflow.set_experiment("anomaly-detection-smap")
         run = mlflow.start_run()
-        mlflow.log_params({k: v for k, v in CONFIG.items() if k != "device"})
+        mlflow.log_params({k: v for k, v in cfg.items() if k != "device"})
     else:
         run = None
 
     try:
-        for epoch in range(1, CONFIG["num_epochs"] + 1):
+        for epoch in range(1, cfg["num_epochs"] + 1):
             t0 = time.time()
             train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-            val_loss = val_epoch(model, test_loader, criterion, device)
+            # val_loader is built from train_split[:val] — NOT the test set.
+            val_loss = val_epoch(model, val_loader, criterion, device)
             scheduler.step(val_loss)
             elapsed = time.time() - t0
 
@@ -351,13 +569,17 @@ def main():
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save(model.state_dict(), CONFIG["save_path"])
+                torch.save(model.state_dict(), cfg["save_path"])
 
             if epoch % 5 == 0:
                 print(
-                    f"Ep {epoch:02d} | Train {train_loss:.6f} | "
+                    f"Ep {epoch:03d} | Train {train_loss:.6f} | "
                     f"Val {val_loss:.6f} | {elapsed:.1f}s"
                 )
+
+            if early_stopper.step(val_loss):
+                print(f"Early stopping at epoch {epoch} (no val improvement for {early_stopper.patience} epochs)")
+                break
     finally:
         if mlflow_available and run is not None:
             mlflow.end_run()
@@ -365,61 +587,96 @@ def main():
     # ------------------------------------------------------------------
     # 4. Load best checkpoint and evaluate
     # ------------------------------------------------------------------
-    model.load_state_dict(torch.load(CONFIG["save_path"], map_location=device))
+    model.load_state_dict(torch.load(cfg["save_path"], map_location=device))
     model.eval()
 
     # LSTM-AE window scores → point scores
     ae_window_scores = reconstruction_errors(model, test_loader, device).numpy()
-    ae_point_scores = window_to_point_scores(ae_window_scores, len(test_data), CONFIG["window_size"])
+    ae_point_scores = window_to_point_scores(ae_window_scores, len(test_data), cfg["window_size"])
 
     # Trim labels to match point scores length (windows don't cover tail)
     scored_length = len(ae_point_scores)
     labels_trimmed = labels[:scored_length]
 
-    best_thresh, best_f1, best_preds = find_best_threshold(ae_point_scores, labels_trimmed)
+    # ------------------------------------------------------------------
+    # Deployment threshold — derived from TRAINING error distribution only.
+    #
+    # Previously find_best_threshold() swept 200 values against the labelled
+    # test set and reported the best F1.  That is an oracle: in production
+    # you never have test labels to select a threshold.  The correct approach
+    # is to set the threshold from the training reconstruction errors (e.g.,
+    # 99th percentile), then report what F1 that threshold achieves on test.
+    # ------------------------------------------------------------------
+    train_errors = reconstruction_errors(model, train_loader, device).numpy()
+    deployment_threshold = float(np.percentile(train_errors, 99))
 
-    ae_prec = precision_score(labels_trimmed, best_preds, zero_division=0)
-    ae_rec = recall_score(labels_trimmed, best_preds, zero_division=0)
-    try:
-        ae_auc = roc_auc_score(labels_trimmed, ae_point_scores)
-    except ValueError:
-        ae_auc = float("nan")
+    deploy_preds = (ae_point_scores >= deployment_threshold).astype(int)
 
-    # Isolation Forest baseline
-    if_scores = isolation_forest_errors(train_windows, test_windows)
-    if_point_scores = window_to_point_scores(if_scores, len(test_data), CONFIG["window_size"])
-    _, if_f1, _ = find_best_threshold(if_point_scores, labels_trimmed)
+    # Save deployment threshold so the API can load the correct value
+    # instead of relying on a hardcoded env-var default.
+    threshold_path = os.path.join(os.path.dirname(cfg["save_path"]), "threshold.json")
+    with open(threshold_path, "w") as fh:
+        json.dump({"threshold": deployment_threshold}, fh, indent=2)
+    print(f"Deployment threshold (99th pct of train errors): {deployment_threshold:.6f}")
+    print(f"Saved threshold → {threshold_path}")
 
-    delta = (best_f1 - if_f1) / max(if_f1, 1e-9) * 100
+    deploy_metrics = compute_metrics(ae_point_scores, labels_trimmed, deploy_preds, deployment_threshold)
+
+    # Oracle threshold (for reference only — NOT used by the deployed API)
+    oracle_thresh, _, oracle_preds = find_best_threshold(ae_point_scores, labels_trimmed)
+    oracle_metrics = compute_metrics(ae_point_scores, labels_trimmed, oracle_preds, oracle_thresh)
+
+    # Isolation Forest baseline — calibrated to the actual anomaly rate.
+    # Previously used contamination="auto" (≈10%) on a channel with 3.4%
+    # anomaly rate, causing IsolationForest to over-flag and score unfairly low.
+    if_contamination = max(float(anomaly_rate), 0.01)
+    if_scores = isolation_forest_errors(train_windows, test_windows, contamination=if_contamination)
+    if_point_scores = window_to_point_scores(if_scores, len(test_data), cfg["window_size"])
+    _, _, if_preds = find_best_threshold(if_point_scores, labels_trimmed)
+    if_thresh, _, _ = find_best_threshold(if_point_scores, labels_trimmed)
+    if_metrics = compute_metrics(if_point_scores, labels_trimmed, if_preds, if_thresh)
 
     # ------------------------------------------------------------------
     # 5. Print comparison table
     # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print(f"LSTM-AE → F1:{best_f1:.3f}  Prec:{ae_prec:.3f}  Rec:{ae_rec:.3f}  AUC:{ae_auc:.3f}")
-    print(f"Iso.F.  → F1:{if_f1:.3f}")
-    print(f"Δ F1    → {delta:+.1f}%")
-    print("=" * 60 + "\n")
+    def _row(name, m):
+        return (
+            f"  F1:{m['f1']:.3f}  Prec:{m['precision']:.3f}  Rec:{m['recall']:.3f}  "
+            f"AUC:{m['auc_roc'] or 'n/a'}  AP:{m['avg_precision'] or 'n/a'}  "
+            f"FAR:{m['false_alarm_rate']:.3f}  Delay:{m['detection_delay_steps']:.0f}steps"
+        )
+
+    print("\n" + "=" * 80)
+    print("LSTM-AE (deployment threshold — production-realistic)")
+    print(_row("deploy", deploy_metrics))
+    print("LSTM-AE (oracle threshold — evaluation ceiling, NOT for deployment)")
+    print(_row("oracle", oracle_metrics))
+    print(f"Iso.Forest (contamination={if_contamination:.3f})")
+    print(_row("if", if_metrics))
+    print("=" * 80 + "\n")
 
     # ------------------------------------------------------------------
     # 6. Save results.json
     # ------------------------------------------------------------------
     results = {
-        "channel": CONFIG["channel"],
-        "lstm_ae": {
-            "f1": round(best_f1, 4),
-            "precision": round(ae_prec, 4),
-            "recall": round(ae_rec, 4),
-            "auc": round(ae_auc, 4) if not np.isnan(ae_auc) else None,
-            "threshold": round(float(best_thresh), 6),
+        "channel": cfg["channel"],
+        "lstm_ae_deployment": {
+            "threshold_source": "99th percentile of training reconstruction errors",
+            **deploy_metrics,
         },
-        "isolation_forest": {"f1": round(if_f1, 4)},
-        "delta_f1_pct": round(delta, 2),
+        "lstm_ae_oracle": {
+            "threshold_source": "oracle sweep over test labels — ceiling only, not for deployment",
+            **oracle_metrics,
+        },
+        "isolation_forest": {
+            "contamination_used": round(if_contamination, 4),
+            **if_metrics,
+        },
         "train_loss_history": metrics_log["train_loss"],
         "val_loss_history": metrics_log["val_loss"],
     }
-    os.makedirs(CONFIG["out_dir"], exist_ok=True)
-    results_path = os.path.join(CONFIG["out_dir"], "results.json")
+    os.makedirs(cfg["out_dir"], exist_ok=True)
+    results_path = os.path.join(cfg["out_dir"], "results.json")
     with open(results_path, "w") as fh:
         json.dump(results, fh, indent=2)
     print(f"Saved results → {results_path}")
@@ -428,9 +685,11 @@ def main():
     # 7. Plots
     # ------------------------------------------------------------------
     plot_anomaly_results(
-        test_data, ae_point_scores, best_thresh, labels_trimmed, best_preds, CONFIG["out_dir"]
+        test_data, ae_point_scores, deployment_threshold, labels_trimmed, deploy_preds, cfg["out_dir"]
     )
-    plot_loss_curve(metrics_log["train_loss"], metrics_log["val_loss"], CONFIG["out_dir"])
+    plot_loss_curve(metrics_log["train_loss"], metrics_log["val_loss"], cfg["out_dir"])
+
+    return cfg, model, device
 
 
 if __name__ == "__main__":
