@@ -66,14 +66,16 @@ anomaly-detection/
 │   │                        #   deployment threshold, MLflow logging, evaluation, plots
 │   ├── api.py               # FastAPI REST API — /predict, /predict/batch, /health, /info
 │   ├── lp_optimizer.py      # LP triage: fractional knapsack via scipy.optimize.linprog
-│   └── find_best_channel.py # Sweep all SMAP channels, rank by F1
+│   ├── des_simulator.py     # SimPy discrete-event simulation of the post-LP inspection queue
+│   └── drift_monitor.py     # KS-test data drift detection — flags distribution shift in production
 ├── tests/
 │   ├── conftest.py          # Shared fixtures (model, API client, temp files)
 │   ├── test_dataset.py      # 24 tests — windows, splits, dataloaders
 │   ├── test_model.py        # 17 tests — forward shapes, reconstruction errors
 │   ├── test_train.py        # 23 tests — training loop, early stopping, threshold search
 │   ├── test_api.py          # 33 tests — all endpoints, batch inference, health probe
-│   └── test_lp_optimizer.py # 32 tests — LP triage, naive greedy, LP vs greedy comparison
+│   ├── test_lp_optimizer.py # 32 tests — LP triage, naive greedy, LP vs greedy comparison
+│   └── test_des_simulator.py# DES simulation tests — queue throughput, priority ordering
 ├── notebooks/
 │   └── AnomalyDetection_Colab.ipynb  # Interactive walkthrough with ONNX export
 ├── assets/                  # Plots committed to repo

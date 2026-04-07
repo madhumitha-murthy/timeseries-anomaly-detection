@@ -18,3 +18,5 @@ src/mlflow.db
 src/__pycache__/
 mlruns/
 *.db
+.coverage
+.coverage.*
