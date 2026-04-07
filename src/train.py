@@ -34,6 +34,13 @@ from sklearn.metrics import (
 )
 
 from dataset import get_dataloaders, load_channel, load_labels, train_val_split
+from lp_optimizer import (
+    compare_lp_vs_greedy,
+    extract_anomaly_candidates,
+    lp_triage,
+    naive_greedy_triage,
+)
+from des_simulator import compare_des_schedules
 from model import LSTMAutoencoder, isolation_forest_errors, reconstruction_errors
 
 # ---------------------------------------------------------------------------
@@ -431,6 +438,59 @@ def plot_loss_curve(train_history, val_history, out_dir):
 
 
 # ---------------------------------------------------------------------------
+# LP comparison printer
+# ---------------------------------------------------------------------------
+
+def _print_lp_comparison(cmp: dict, total_steps: int) -> None:
+    """Print the LP vs naive-greedy comparison table to stdout."""
+    W = 72
+    lp  = cmp["lp"]
+    gr  = cmp["greedy"]
+
+    print("\n" + "=" * W)
+    print("LP TRIAGE — Anomaly Segment Inspection (LSTM-AE reconstruction errors)")
+    print(
+        f"  Budget : {cmp['budget_fraction']*100:.0f}% of {total_steps} test steps"
+        f" = {cmp['budget_steps']} steps"
+    )
+    print(f"  Candidate segments : {cmp['n_candidates']}")
+    print(f"  Total anomaly score available : {cmp['total_score']:.4f}")
+    print()
+    print(f"  {'':22s}  {'Objective':>10}  {'Budget used':>11}  "
+          f"{'Utilization':>11}  {'Coverage':>9}")
+    print(f"  {'-'*22}  {'-'*10}  {'-'*11}  {'-'*11}  {'-'*9}")
+    print(f"  {'LP  (scipy linprog)':22s}  {lp['objective']:>10.4f}  "
+          f"{lp['budget_used']:>9.1f} s  "
+          f"{lp['budget_utilization_pct']:>9.1f} %  "
+          f"{lp['coverage_pct']:>7.1f} %")
+    print(f"  {'Greedy (naive)':22s}  {gr['objective']:>10.4f}  "
+          f"{gr['budget_used']:>9.1f} s  "
+          f"{gr['budget_utilization_pct']:>9.1f} %  "
+          f"{gr['coverage_pct']:>7.1f} %")
+    print()
+
+    if cmp["lp_gain_pct"] > 0:
+        print(
+            f"  LP gain : +{cmp['lp_gain_pct']:.1f} % more anomaly signal vs naive greedy"
+        )
+    else:
+        print("  LP gain : 0 % — both methods agree (all segments fit in budget)")
+    print("  LP is provably optimal for fractional knapsack.")
+
+    if lp["top_segments"]:
+        print()
+        print("  Segments selected by LP  (priority > 0.5, sorted desc):")
+        for i, seg in enumerate(lp["top_segments"][:5], 1):
+            print(
+                f"    {i}.  steps [{seg['start']:5d} – {seg['end']:5d}]"
+                f"  score={seg['score']:.4f}  priority={seg['priority']:.3f}"
+            )
+        if lp["n_selected"] > 5:
+            print(f"    … and {lp['n_selected'] - 5} more segment(s)")
+    print("=" * W + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -610,6 +670,27 @@ def main(config: dict = None):
     train_errors = reconstruction_errors(model, train_loader, device).numpy()
     deployment_threshold = float(np.percentile(train_errors, 99))
 
+    # Save baseline reconstruction error statistics for drift monitoring.
+    # The drift monitor (api.py) compares incoming window scores against this
+    # training distribution using a KS test to detect data/concept drift.
+    baseline_stats_path = os.path.join(os.path.dirname(cfg["save_path"]), "baseline_stats.json")
+    with open(baseline_stats_path, "w") as fh:
+        json.dump(
+            {
+                "mean": float(np.mean(train_errors)),
+                "std": float(np.std(train_errors)),
+                "p50": float(np.percentile(train_errors, 50)),
+                "p95": float(np.percentile(train_errors, 95)),
+                "p99": float(np.percentile(train_errors, 99)),
+                # Store up to 1 000 samples — sufficient for a reliable KS test
+                # while keeping the file small (~50 KB).
+                "sample": train_errors[:1000].tolist(),
+            },
+            fh,
+            indent=2,
+        )
+    print(f"Baseline stats saved → {baseline_stats_path}")
+
     deploy_preds = (ae_point_scores >= deployment_threshold).astype(int)
 
     # Save deployment threshold so the API can load the correct value
@@ -637,7 +718,50 @@ def main(config: dict = None):
     if_metrics = compute_metrics(if_point_scores, labels_trimmed, if_preds, if_thresh)
 
     # ------------------------------------------------------------------
-    # 5. Print comparison table
+    # 5. LP triage — select which predicted anomaly segments to inspect
+    #    given a 10 % inspection budget (fraction of the test period).
+    #    Uses real LSTM-AE reconstruction errors (ae_point_scores).
+    #    Compares LP (provably optimal) vs naive greedy (sort by score).
+    # ------------------------------------------------------------------
+    lp_comparison = compare_lp_vs_greedy(
+        ae_point_scores, deployment_threshold, budget_fraction=0.10
+    )
+    _print_lp_comparison(lp_comparison, scored_length)
+
+    # ------------------------------------------------------------------
+    # 5b. DES simulation — quantify operational impact of LP vs greedy
+    #     scheduling on the downstream inspection workflow.
+    #     Calls lp_triage and naive_greedy_triage separately to obtain the
+    #     raw allocation arrays needed by compare_des_schedules.
+    # ------------------------------------------------------------------
+    budget_steps_des   = max(1, int(0.10 * scored_length))
+    segments_for_des   = extract_anomaly_candidates(ae_point_scores, deployment_threshold)
+    _, x_lp_arr        = lp_triage(ae_point_scores, deployment_threshold, 0.10)
+    x_greedy_arr       = naive_greedy_triage(segments_for_des, budget_steps_des)
+
+    des_cmp = compare_des_schedules(
+        segments_for_des, x_lp_arr, x_greedy_arr,
+        n_machines=2, mttf=50.0, mttr=5.0, seed=42,
+    )
+
+    print("\n" + "=" * 80)
+    print("DES SIMULATION — LP vs Greedy Inspection Schedule")
+    print(f"  Segments: {des_cmp['lp'].n_jobs} LP jobs | {des_cmp['greedy'].n_jobs} greedy jobs")
+    print(f"  Machines: {des_cmp['n_machines']}  |  Breakdowns: {'on (MTTF=50, MTTR=5)' if des_cmp['breakdown_enabled'] else 'off'}")
+    print(f"  {'Metric':<28} {'LP':>12} {'Greedy':>12}")
+    print(f"  {'-'*52}")
+    print(f"  {'Makespan':<28} {des_cmp['lp'].makespan:>12.2f} {des_cmp['greedy'].makespan:>12.2f}")
+    print(f"  {'Mean wait time':<28} {des_cmp['lp'].mean_wait_time:>12.4f} {des_cmp['greedy'].mean_wait_time:>12.4f}")
+    print(f"  {'P95 wait time':<28} {des_cmp['lp'].p95_wait_time:>12.4f} {des_cmp['greedy'].p95_wait_time:>12.4f}")
+    print(f"  {'Machine utilisation':<28} {des_cmp['lp'].machine_utilisation:>12.4f} {des_cmp['greedy'].machine_utilisation:>12.4f}")
+    print(f"  {'Throughput (jobs/t)':<28} {des_cmp['lp'].throughput:>12.4f} {des_cmp['greedy'].throughput:>12.4f}")
+    print(f"  {'Breakdowns':<28} {des_cmp['lp'].breakdown_count:>12} {des_cmp['greedy'].breakdown_count:>12}")
+    print(f"  LP wait reduction  : {des_cmp['lp_wait_reduction_pct']:+.2f} %")
+    print(f"  LP makespan reduction: {des_cmp['lp_makespan_reduction_pct']:+.2f} %")
+    print("=" * 80 + "\n")
+
+    # ------------------------------------------------------------------
+    # 6. Print comparison table
     # ------------------------------------------------------------------
     def _row(name, m):
         return (
@@ -656,7 +780,7 @@ def main(config: dict = None):
     print("=" * 80 + "\n")
 
     # ------------------------------------------------------------------
-    # 6. Save results.json
+    # 7. Save results.json
     # ------------------------------------------------------------------
     results = {
         "channel": cfg["channel"],
@@ -673,7 +797,38 @@ def main(config: dict = None):
             **if_metrics,
         },
         "train_loss_history": metrics_log["train_loss"],
-        "val_loss_history": metrics_log["val_loss"],
+        "val_loss_history":   metrics_log["val_loss"],
+        "lp_triage":          lp_comparison,
+        "des_simulation": {
+            "n_machines":                des_cmp["n_machines"],
+            "breakdown_enabled":         des_cmp["breakdown_enabled"],
+            "lp_wait_reduction_pct":     des_cmp["lp_wait_reduction_pct"],
+            "lp_makespan_reduction_pct": des_cmp["lp_makespan_reduction_pct"],
+            "lp": {
+                "schedule_name":        des_cmp["lp"].schedule_name,
+                "n_jobs":               des_cmp["lp"].n_jobs,
+                "makespan":             des_cmp["lp"].makespan,
+                "mean_wait_time":       des_cmp["lp"].mean_wait_time,
+                "p95_wait_time":        des_cmp["lp"].p95_wait_time,
+                "mean_inspection_time": des_cmp["lp"].mean_inspection_time,
+                "machine_utilisation":  des_cmp["lp"].machine_utilisation,
+                "throughput":           des_cmp["lp"].throughput,
+                "jobs_completed":       des_cmp["lp"].jobs_completed,
+                "breakdown_count":      des_cmp["lp"].breakdown_count,
+            },
+            "greedy": {
+                "schedule_name":        des_cmp["greedy"].schedule_name,
+                "n_jobs":               des_cmp["greedy"].n_jobs,
+                "makespan":             des_cmp["greedy"].makespan,
+                "mean_wait_time":       des_cmp["greedy"].mean_wait_time,
+                "p95_wait_time":        des_cmp["greedy"].p95_wait_time,
+                "mean_inspection_time": des_cmp["greedy"].mean_inspection_time,
+                "machine_utilisation":  des_cmp["greedy"].machine_utilisation,
+                "throughput":           des_cmp["greedy"].throughput,
+                "jobs_completed":       des_cmp["greedy"].jobs_completed,
+                "breakdown_count":      des_cmp["greedy"].breakdown_count,
+            },
+        },
     }
     os.makedirs(cfg["out_dir"], exist_ok=True)
     results_path = os.path.join(cfg["out_dir"], "results.json")
@@ -682,7 +837,7 @@ def main(config: dict = None):
     print(f"Saved results → {results_path}")
 
     # ------------------------------------------------------------------
-    # 7. Plots
+    # 8. Plots
     # ------------------------------------------------------------------
     plot_anomaly_results(
         test_data, ae_point_scores, deployment_threshold, labels_trimmed, deploy_preds, cfg["out_dir"]

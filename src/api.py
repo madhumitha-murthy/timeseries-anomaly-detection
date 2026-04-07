@@ -20,13 +20,14 @@ import json
 import logging
 import os
 import time
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from drift_monitor import DriftMonitor
 from model import LSTMAutoencoder
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,8 @@ NUM_LAYERS     = int(os.getenv("NUM_LAYERS", "1"))
 # WINDOW_SIZE=0 means "do not validate seq_len" (backwards-compatible default).
 # Set to the training window size (e.g. 30) to reject windows of wrong length.
 WINDOW_SIZE    = int(os.getenv("WINDOW_SIZE", "0"))
+BASELINE_STATS_PATH = os.path.join(os.path.dirname(MODEL_PATH), "baseline_stats.json")
+DRIFT_WINDOW_SIZE   = int(os.getenv("DRIFT_WINDOW_SIZE", "200"))
 
 # Threshold loaded from saved file at startup; env var is a manual override only.
 # Previously hardcoded to 0.05 while the actual trained threshold was ~6.99,
@@ -72,10 +75,11 @@ app = FastAPI(
 _model: LSTMAutoencoder = None
 _device: torch.device = None
 _default_threshold: float = 0.05  # overwritten at startup from threshold.json
+_drift_monitor: DriftMonitor = None
 
 
 @app.on_event("startup")
-def load_model():
+def load_model():  # noqa: C901
     """Load model weights and deployment threshold once when the server starts.
 
     Threshold is read from the JSON file saved by train.py (99th percentile of
@@ -102,6 +106,10 @@ def load_model():
         logger.warning("Model file not found at %s — serving with random weights", MODEL_PATH)
 
     _model.eval()
+
+    # Initialise drift monitor from training baseline stats
+    global _drift_monitor
+    _drift_monitor = DriftMonitor.from_file(BASELINE_STATS_PATH, window_size=DRIFT_WINDOW_SIZE)
 
     # Load threshold — prefer saved file, fall back to env var
     if _THRESHOLD_ENV_OVERRIDE is not None:
@@ -153,6 +161,18 @@ class AnomalyResponse(BaseModel):
     is_anomaly: bool = Field(..., description="True if anomaly_score >= threshold.")
     threshold_used: float = Field(..., description="Threshold applied to produce is_anomaly.")
     latency_ms: float = Field(..., description="End-to-end inference latency in milliseconds.")
+    drift_detected: Optional[bool] = Field(
+        default=None,
+        description=(
+            "True if a KS test on the rolling reconstruction-error window detects "
+            "a distribution shift from the training baseline. None if the window "
+            "is not yet full (insufficient data for a reliable test)."
+        ),
+    )
+    drift_p_value: Optional[float] = Field(
+        default=None,
+        description="KS test p-value. Values below 0.05 indicate statistically significant drift.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -236,12 +256,38 @@ def predict(request: WindowRequest) -> AnomalyResponse:
     threshold = request.resolved_threshold()
     latency_ms = (time.perf_counter() - t_start) * 1000.0
 
+    # Update drift monitor and check distribution shift
+    _drift_monitor.update(mse)
+    drift_status = _drift_monitor.check()
+
     return AnomalyResponse(
         anomaly_score=round(mse, 6),
         is_anomaly=mse >= threshold,
         threshold_used=threshold,
         latency_ms=round(latency_ms, 3),
+        drift_detected=drift_status.drift_detected if drift_status.p_value is not None else None,
+        drift_p_value=drift_status.p_value,
     )
+
+
+@app.get("/drift/status", tags=["Ops"])
+def drift_status():
+    """
+    Return the current drift monitor state.
+
+    Reports whether the rolling window of recent reconstruction errors has
+    diverged from the training baseline distribution (KS test).  Use this
+    endpoint to build operational dashboards or trigger retraining alerts.
+    """
+    status = _drift_monitor.check()
+    return {
+        "drift_detected": status.drift_detected,
+        "p_value": status.p_value,
+        "ks_statistic": status.ks_statistic,
+        "mean_shift_sigmas": status.mean_shift_sigmas,
+        "message": status.message,
+        "monitor_stats": _drift_monitor.stats,
+    }
 
 
 @app.post("/predict/batch", response_model=List[AnomalyResponse], tags=["Inference"])
@@ -293,12 +339,19 @@ def predict_batch(requests: List[WindowRequest]) -> List[AnomalyResponse]:
     total_latency_ms = (time.perf_counter() - t_start) * 1000.0
     per_window_ms = round(total_latency_ms / len(requests), 3)
 
+    # Feed all batch scores into the drift monitor, then do a single check
+    for mse in mses:
+        _drift_monitor.update(mse)
+    drift_status = _drift_monitor.check()
+
     return [
         AnomalyResponse(
             anomaly_score=round(mse, 6),
             is_anomaly=mse >= req.resolved_threshold(),
             threshold_used=req.resolved_threshold(),
             latency_ms=per_window_ms,
+            drift_detected=drift_status.drift_detected if drift_status.p_value is not None else None,
+            drift_p_value=drift_status.p_value,
         )
         for mse, req in zip(mses, requests)
     ]
