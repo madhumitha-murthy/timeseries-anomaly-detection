@@ -12,7 +12,6 @@ Covers:
                            equal schedules give zero reduction, breakdown flag
 """
 
-import math
 import sys
 import os
 
@@ -24,8 +23,6 @@ import pytest
 
 from des_simulator import (
     InspectionJob,
-    JobResult,
-    SimulationResult,
     compare_des_schedules,
     run_inspection_simulation,
     schedule_from_allocation,
