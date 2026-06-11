@@ -6,14 +6,13 @@
 ![Docker](https://img.shields.io/badge/docker-ready-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Semi-supervised time-series anomaly detection using an **LSTM Autoencoder** trained on NASA SMAP satellite telemetry. The model learns what *normal* looks like and flags time windows it cannot reconstruct accurately. Served via a production-grade **FastAPI REST API**, containerised with Docker, and evaluated with a full metric suite including False Alarm Rate and Detection Delay.
+Semi-supervised time-series anomaly detection using an **LSTM Autoencoder** trained on NASA SMAP satellite telemetry. The model learns normal behaviour and flags windows it cannot reconstruct accurately. Deployed via a **FastAPI REST API**, containerised with Docker, with LP-based anomaly triage and discrete-event simulation of the inspection workflow.
 
 ---
 
 ## Results
 
 Evaluated on NASA SMAP channel **E-7** (25 features · 8,310 test steps · 3.4% anomaly rate).
-Early stopping fired at epoch 85 — no overfitting.
 
 | Model | F1 | Precision | Recall | AUC-ROC | Avg Precision | False Alarm Rate | Detection Delay |
 |---|---|---|---|---|---|---|---|
@@ -21,10 +20,8 @@ Early stopping fired at epoch 85 — no overfitting.
 | LSTM-AE (oracle ceiling) | 0.765 | 1.000 | 0.619 | 0.860 | 0.723 | 0.0% | 42 steps |
 | Isolation Forest | 0.083 | 0.044 | 0.779 | 0.448 | 0.031 | 59.4% | 0 steps |
 
-> **Deployment threshold** = 99th percentile of training reconstruction errors (5.114) — no test labels needed.
-> **Oracle threshold** = best F1 sweep over labelled test set (7.518) — upper bound only, not a real deployment strategy.
-> **False Alarm Rate** = fraction of normal timesteps wrongly flagged.
-> **Detection Delay** = median steps from anomaly segment start to first detection.
+> Deployment threshold = 99th percentile of training reconstruction errors — no test labels used.
+> Oracle threshold = best F1 sweep over labelled test set — upper bound only.
 
 ### Anomaly Detection Plot
 ![Anomaly Detection Results](assets/anomaly_results.png)
@@ -49,9 +46,7 @@ Reconstruction             Decoder LSTM           Decoder input
 MSE vs original  ──►  Deployment threshold  ──►  Anomaly flag (0/1)
 ```
 
-The model is trained **only on normal data**. At inference, anomalous patterns produce high reconstruction error (MSE). The deployment threshold is derived from the 99th percentile of training errors — calibrated without ever touching the test set.
-
-Each time-step's score is the **maximum** reconstruction error across all windows containing it (*point-adjust*, Hundman et al. 2018).
+Trained on normal data only. Anomalous patterns produce high reconstruction error (MSE). Each time-step score = max reconstruction error across all containing windows (point-adjust, Hundman et al. 2018).
 
 ---
 
@@ -60,34 +55,21 @@ Each time-step's score is the **maximum** reconstruction error across all window
 ```
 anomaly-detection/
 ├── src/
-│   ├── dataset.py           # Data loading, StandardScaler, sliding windows, train/val split
-│   ├── model.py             # LSTMAutoencoder, reconstruction_errors, isolation_forest_errors
-│   ├── train.py             # Training pipeline: YAML config, argparse CLI, early stopping,
-│   │                        #   deployment threshold, MLflow logging, evaluation, plots
-│   ├── api.py               # FastAPI REST API — /predict, /predict/batch, /health, /info
-│   ├── lp_optimizer.py      # LP triage: fractional knapsack via scipy.optimize.linprog
-│   ├── des_simulator.py     # SimPy discrete-event simulation of the post-LP inspection queue
-│   └── drift_monitor.py     # KS-test data drift detection — flags distribution shift in production
-├── tests/
-│   ├── conftest.py          # Shared fixtures (model, API client, temp files)
-│   ├── test_dataset.py      # 24 tests — windows, splits, dataloaders
-│   ├── test_model.py        # 17 tests — forward shapes, reconstruction errors
-│   ├── test_train.py        # 23 tests — training loop, early stopping, threshold search
-│   ├── test_api.py          # 33 tests — all endpoints, batch inference, health probe
-│   ├── test_lp_optimizer.py # 32 tests — LP triage, naive greedy, LP vs greedy comparison
-│   └── test_des_simulator.py# DES simulation tests — queue throughput, priority ordering
+│   ├── dataset.py           # Data loading, StandardScaler, sliding windows
+│   ├── model.py             # LSTMAutoencoder, reconstruction_errors
+│   ├── train.py             # Training pipeline, early stopping, evaluation, plots
+│   ├── api.py               # FastAPI — /predict, /predict/batch, /health, /info
+│   ├── lp_optimizer.py      # LP triage: constrained fractional knapsack (HiGHS)
+│   ├── des_simulator.py     # SimPy discrete-event simulation of inspection queue
+│   └── drift_monitor.py     # KS-test data drift detection
+├── tests/                   # 68 tests — dataset, model, train, api, LP, DES
 ├── notebooks/
-│   └── AnomalyDetection_Colab.ipynb  # Interactive walkthrough with ONNX export
+│   └── AnomalyDetection_Colab.ipynb
 ├── assets/                  # Plots committed to repo
-├── models/                  # Saved checkpoint + threshold.json (gitignored except .gitkeep)
-├── outputs/                 # results.json, anomaly plot, loss curve
-├── data/                    # SMAP .npy files (not committed)
 ├── config.yaml              # Default training configuration
 ├── Dockerfile
 ├── docker-compose.yml
-├── requirements.txt         # Pinned production dependencies
-├── requirements-dev.txt     # + pytest, ruff
-├── pyproject.toml           # Ruff lint configuration
+├── requirements.txt
 └── .github/workflows/ci.yml # GitHub Actions: lint + test on every push
 ```
 
@@ -100,8 +82,7 @@ anomaly-detection/
 ```bash
 git clone https://github.com/madhumitha-murthy/timeseries-anomaly-detection.git
 cd timeseries-anomaly-detection
-
-python -m venv venv && source venv/bin/activate  # Windows: venv\Scripts\activate
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -112,29 +93,16 @@ git clone --depth 1 https://github.com/khundman/telemanom.git
 cp -r telemanom/data ./data
 ```
 
-Or download from [Kaggle — NASA SMAP Anomaly Detection Dataset](https://www.kaggle.com/datasets/patrickfleith/nasa-anomaly-detection-dataset-smap-msl) and place the `train/`, `test/`, and `labeled_anomalies.csv` under `data/`.
+Or download from [Kaggle — NASA SMAP Anomaly Detection Dataset](https://www.kaggle.com/datasets/patrickfleith/nasa-anomaly-detection-dataset-smap-msl) and place `train/`, `test/`, and `labeled_anomalies.csv` under `data/`.
 
 ### 3. Train
 
 ```bash
-# Default config (config.yaml — channel E-7, window 30, hidden 64)
-cd src && python train.py
-
-# Override from CLI
-cd src && python train.py --channel P-1 --num_epochs 50 --hidden_dim 128
-
-# Use a custom config file
-cd src && python train.py --config ../configs/experiment_2.yaml
+cd src && python train.py                              # default: channel E-7
+cd src && python train.py --channel P-1 --hidden_dim 128
 ```
 
-Outputs:
-```
-models/lstm_ae_best.pth     ← best checkpoint (saved by val loss)
-models/threshold.json       ← deployment threshold (99th pct of train errors)
-outputs/results.json        ← full metric suite
-outputs/anomaly_results.png ← 3-panel diagnostic plot
-outputs/loss_curve.png      ← train/val loss over epochs
-```
+Outputs saved to `models/` and `outputs/`.
 
 ### 4. Serve the API
 
@@ -161,12 +129,8 @@ pytest --cov=src --cov-report=term-missing
 ## API Reference
 
 ### `GET /health`
-Readiness probe — returns 503 if model not loaded or threshold not configured.
-```bash
-curl http://localhost:8000/health
-```
 ```json
-{"status": "ok", "model_loaded": true, "threshold": 6.28, "device": "cpu"}
+{"status": "ok", "model_loaded": true, "threshold": 5.11, "device": "cpu"}
 ```
 
 ### `POST /predict`
@@ -174,162 +138,32 @@ Score a single time-series window.
 ```bash
 curl -X POST http://localhost:8000/predict \
   -H "Content-Type: application/json" \
-  -d '{
-    "window": [[0.12, 0.05, -0.3, ...], [...], ...],
-    "threshold": 6.28
-  }'
+  -d '{"window": [[0.12, 0.05, -0.3, ...], ...], "threshold": 5.11}'
 ```
 ```json
-{
-  "anomaly_score": 1.243,
-  "is_anomaly": false,
-  "threshold_used": 6.28,
-  "latency_ms": 11.74
-}
+{"anomaly_score": 1.243, "is_anomaly": false, "threshold_used": 5.11, "latency_ms": 11.74}
 ```
 
 ### `POST /predict/batch`
-Score multiple windows in a **single forward pass** — significantly faster than N individual calls.
-```bash
-curl -X POST http://localhost:8000/predict/batch \
-  -H "Content-Type: application/json" \
-  -d '[{"window": [[...], ...]}, {"window": [[...], ...]}]'
-```
+Score multiple windows in a single forward pass.
 
 ### `GET /info`
 Returns model metadata: `input_dim`, `hidden_dim`, `num_layers`, `default_threshold`.
 
-Interactive Swagger docs at **`http://localhost:8000/docs`**.
+Swagger docs at **`http://localhost:8000/docs`**.
 
 ---
 
-## Configuration
+## Anomaly Triage — LP + DES
 
-All training hyperparameters live in `config.yaml`. CLI flags override file values.
+After detection, flagged segments are triaged under a fixed inspection budget (10% of test steps) using a **constrained fractional knapsack LP** (HiGHS solver):
 
-```yaml
-channel:      E-7      # SMAP channel ID
-data_dir:     ../data
-hidden_dim:   64       # LSTM hidden units
-num_layers:   1
-dropout:      0.0
-window_size:  30       # Sliding window length
-batch_size:   32
-num_epochs:   200      # Upper bound — early stopping fires before this
-lr:           0.001
-weight_decay: 0.00001
-save_path:    ../models/lstm_ae_best.pth
-out_dir:      ../outputs/
-```
+- **C1** — per-segment budget cap: no single segment may consume more than 25% of the budget
+- **C2** — minimum coverage floor: top-2 segments by score must receive ≥ 50% inspection fraction
 
-> `device` is always auto-detected from CUDA availability — never set in the config.
+Three methods compared: LP (constrained), density-greedy (C1 only), naive-greedy (raw score sort).
 
----
-
-## Anomaly Triage — Linear Programme
-
-### Business problem
-
-The LSTM Autoencoder flags every test time-step with a reconstruction error score.
-After thresholding, the result is a set of **candidate anomaly segments** — contiguous
-runs of flagged points.  In a real deployment a maintenance team must physically
-inspect those segments, and inspection is expensive: each time-step costs operator time.
-
-Given a fixed **inspection budget** (e.g. 10 % of the test period), the team needs to
-decide *which* segments to prioritise.  The intuitive approach — sort by anomaly score,
-pick the top ones — is **suboptimal** because it ignores inspection cost.  A segment with
-the highest raw score might be so long that it consumes the entire budget, preventing
-inspection of several shorter but denser segments that together contain more anomaly signal.
-
-### LP formulation
-
-```
-Variables   x_s ∈ [0, 1]   fraction of segment s to inspect
-                             (x_s = 1 → fully prioritise | x_s = 0 → skip)
-
-Maximise    Σ_s  score_s · x_s          anomaly signal captured
-
-Subject to  Σ_s  length_s · x_s  ≤  B  budget constraint (B = 10 % of test steps)
-            0 ≤ x_s ≤ 1  for all s       variable bounds
-```
-
-`score_s` = mean LSTM-AE reconstruction error over segment `s` (anomaly density).
-`length_s` = number of time-steps in segment `s` (inspection cost / weight).
-`B` = `budget_steps` = `int(0.10 × len(test_data))`.
-
-Solved via **`scipy.optimize.linprog`** (HiGHS back-end).
-The LP framework makes it trivial to add further operational constraints —
-per-channel caps, minimum inspection gaps, safety-floor score requirements —
-without rewriting the solver.
-
-### Three-way comparison: LP vs density-greedy vs naive-greedy
-
-The honest framing:
-
-| Method | Role | Floor (C2) respected? | Cap (C1) respected? |
-|---|---|---|---|
-| **LP (HiGHS)** | Provably optimal given C1+C2 | Yes | Yes |
-| Density-greedy | Optimal for *unconstrained* knapsack | No — may skip low-density priority segs | Yes |
-| Naive-greedy | Baseline only — sorts by raw score | No | No |
-
-**LP = density-greedy when C1/C2 are not binding** (all segments fit in budget, no long segments hit the cap).
-**LP > density-greedy when constraints are active** (a high-priority segment has low density and would be under-allocated by density-greedy).
-
-**Concrete example where floor constraint matters** (budget = 6 steps):
-```
-Segment A : score=3.0, length=10 → density=0.30  (high-priority, low density)
-Segment B : score=2.5, length=2  → density=1.25
-
-floor=0.50 on top-1 → LP forces x_A ≥ 0.50 (5 steps), then gives B 0.5 steps
-density-greedy: picks B fully (2 steps), gives A only 0.40 (< floor — VIOLATED)
-```
-
-### Actual results on E-7 (6 candidate segments, budget=831 steps, total segment length=375 steps)
-
-All 375 steps fit within the 831-step budget, so **all three methods achieve identical
-objective = 51.71 (100 % coverage)**. Constraints are not binding on this channel.
-The LP result is correct and honest: when segments are small, simple greedy suffices.
-
-```
-Method                       Objective  Budget used   Util%   Cover%  Floor viol
-LP (constrained, HiGHS)        51.7059      375.0 s   45.1%   100.0%           —
-Density-greedy (C1 only)       51.7059      375.0 s   45.1%   100.0%           0
-Naive-greedy (raw score)       51.7059      375.0 s   45.1%   100.0%           0
-
-LP vs naive-greedy    :  0 % — all segments fit in budget
-LP vs density-greedy  :  ≈0 % — constraints NOT active (equivalent)
-```
-
----
-
-## Key Engineering Decisions
-
-| Decision | Rationale |
-|---|---|
-| **Train/val split (80/20, time-ordered)** | Val set comes from the same anomaly-free training distribution — no leakage. Previously the test set was used for checkpoint selection, inflating reported performance. |
-| **Deployment threshold = 99th pct of training errors** | Calibrated without test labels — reflects what a real deployed system can do. Oracle threshold (sweep over test labels) is reported separately as an evaluation ceiling. |
-| **Early stopping (patience=15)** | Stops training when val loss stops improving. Fired at epoch 71 on E-7, saving 129 wasted epochs. |
-| **Real batch inference (`np.stack` → single forward pass)** | Previously `/predict/batch` called `/predict` N times in a loop — a performance anti-pattern. Now stacks all windows into one tensor (B, W, F) for a single LSTM pass. |
-| **Threshold loaded from `threshold.json` at API startup** | Eliminates the hardcoded `THRESHOLD=0.05` that caused every window to be flagged as anomalous (actual trained threshold is ~6.3). |
-| **WINDOW_SIZE env var for seq_len validation** | API rejects windows of the wrong length with a 400 before they reach the model, preventing silent shape errors. |
-| **Gradient clipping `max_norm=1.0`** | BPTT through many time-steps can cause exploding gradients in LSTMs. Clipping caps the update magnitude without eliminating gradient signal. |
-| **IsolationForest contamination = `labels.mean()`** | Previously used `"auto"` (~10%) on a channel with 3.4% anomaly rate, causing the baseline to over-flag and score unfairly. Calibrating to the true rate gives a fair comparison. |
-| **Point-adjust max-pooling** | Maps window scores to per-timestep scores by taking the MAX over all containing windows — conservative and standard in the SMAP/MSL literature (Hundman et al. 2018). |
-| **MLflow experiment tracking** | Logs hyperparameters, per-epoch train/val loss, and the best checkpoint as an artefact for A/B comparison across runs. |
-
----
-
-## Metrics Explained
-
-| Metric | Formula | Why It Matters |
-|---|---|---|
-| **F1** | 2 · P · R / (P + R) | Balanced measure on imbalanced data |
-| **Precision** | TP / (TP + FP) | Cost of false alarms |
-| **Recall** | TP / (TP + FN) | Cost of missed anomalies |
-| **AUC-ROC** | Area under ROC curve | Threshold-independent discriminative power |
-| **Avg Precision** | Area under PR curve | Better than AUC-ROC at high class imbalance |
-| **False Alarm Rate** | FP / (FP + TN) | Fraction of normal steps wrongly flagged — critical in manufacturing |
-| **Detection Delay** | Median steps from anomaly start to first detection | Lead time before failure — lower = earlier warning |
+A **SimPy discrete-event simulation** then models the physical inspection queue — N parallel machines, exponential MTTF/MTTR breakdown model — and compares how LP-fraction ordering vs naive ordering affects wait times.
 
 ---
 
@@ -338,21 +172,17 @@ LP vs density-greedy  :  ≈0 % — constraints NOT active (equivalent)
 | Layer | Technology |
 |---|---|
 | Model | PyTorch LSTM Autoencoder |
-| Data | NumPy, Pandas, scikit-learn (StandardScaler) |
-| Baseline | scikit-learn IsolationForest |
-| Optimisation | SciPy `linprog` (HiGHS) — LP anomaly triage |
+| Data | NumPy, Pandas, scikit-learn |
+| Optimisation | SciPy `linprog` (HiGHS) |
+| Simulation | SimPy |
 | API | FastAPI + Pydantic + Uvicorn |
 | Experiment tracking | MLflow |
 | Containerisation | Docker + Docker Compose |
-| CI/CD | GitHub Actions (ruff lint + pytest + coverage) |
-| Config | YAML + argparse |
+| CI/CD | GitHub Actions (ruff + pytest) |
 
 ---
 
 ## Dataset
 
-**NASA SMAP** (Soil Moisture Active Passive) — released by NASA JPL, curated by Hundman et al. ([Detecting Spacecraft Anomalies Using LSTMs and Nonparametric Dynamic Thresholding](https://arxiv.org/abs/1802.04431), KDD 2018).
-
-- 54 telemetry channels · 562 labelled anomaly sequences
-- Pre-split into anomaly-free train and mixed test splits
-- Channel E-7: 2,769 train steps · 8,310 test steps · 3.4% anomaly rate
+**NASA SMAP** — released by NASA JPL, curated by Hundman et al. ([KDD 2018](https://arxiv.org/abs/1802.04431)).
+54 telemetry channels · 562 labelled anomaly sequences · pre-split train/test.
