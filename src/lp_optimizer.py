@@ -9,60 +9,52 @@ real deployment a maintenance team must physically inspect flagged regions, and
 inspection is expensive: each time-step costs operator time.
 
 Given a fixed inspection budget (e.g. 10 % of the test period), the team needs
-to decide *which* segments to prioritise.  The obvious heuristic — sort by
-anomaly score, pick the top ones — is suboptimal because it ignores inspection
-cost.  A segment with the highest raw score might be so long that it consumes
-the entire budget, preventing the team from inspecting several shorter but
-high-density segments that together contain more anomaly signal.
+to decide *which* segments to prioritise.
 
-The correct formulation is a Linear Programme.
-
-LP formulation — Fractional Knapsack
-─────────────────────────────────────
-    Input:
-      S candidate segments, each with
-        score_s  : mean LSTM-AE reconstruction error  (anomaly signal density)
-        length_s : number of time-steps               (inspection cost / weight)
-      B : budget_steps  (maximum time-steps the team can inspect)
-
+LP formulation — Constrained Fractional Knapsack
+─────────────────────────────────────────────────
     Decision variables:
       x_s ∈ [0, 1]   fraction of segment s to inspect
-        x_s = 1 → fully prioritise  |  x_s = 0 → skip
 
     Objective  (maximise anomaly signal covered):
       maximise   Σ_s  score_s · x_s
 
     Constraints:
-      Σ_s  length_s · x_s  ≤  B        (budget constraint)
-      0  ≤  x_s  ≤  1   for all s       (variable bounds)
+      (C0)  Σ_s  length_s · x_s  ≤  B              total budget
+      (C1)  length_s · x_s       ≤  cap · B   ∀ s  per-segment budget cap
+            (no single segment may consume > cap fraction of budget;
+             implemented as A_ub rows)
+      (C2)  x_s  ≥  floor                    ∀ s in top-K by score
+            (high-severity segments must receive minimum coverage;
+             implemented as variable lower bounds)
+      (C3)  0  ≤  x_s  ≤  1                 ∀ s  variable bounds
 
     scipy.optimize.linprog minimises, so we negate: minimise  −score^T x.
 
-Why LP beats naive greedy
-──────────────────────────
-Naive greedy sorts by raw score and picks the top segments until the budget is
-exhausted.  This is suboptimal when a segment has a high absolute score but a
-poor score/length ratio (low anomaly density).
+Why this is non-trivially different from density-greedy
+───────────────────────────────────────────────────────
+The unconstrained fractional knapsack is solvable in O(n log n) by sorting
+segments by score/length density and filling greedily.  Adding C1 and C2
+breaks that equivalence:
 
-Example (budget = 5 steps):
-  Segment A : score = 3.0 · length = 10  →  density = 0.30
-  Segment B : score = 2.5 · length =  2  →  density = 1.25
+  • C1 (per-segment cap):  A high-density segment whose length alone would
+    exhaust the cap is split.  The remaining budget flows to the next-best
+    segment — density-greedy would have spent it all on the first.
 
-  Naive greedy picks A first (highest score):
-    fills 5 of 10 steps → objective = 3.0 × 0.5 = 1.50
+  • C2 (min-coverage floor):  A high-priority segment with low density (long,
+    moderate score) might be skipped entirely by density-greedy.  The floor
+    forces a minimum inspection fraction, which may require the LP to
+    re-balance the remaining budget across lower-density segments — a
+    trade-off that density-greedy cannot express.
 
-  LP (optimal) picks B fully then A partially:
-    B: 2 steps, contribution = 2.50
-    A: 3 steps, contribution = 3.0 × 0.3 = 0.90
-    total objective = 3.40   (+127 % vs naive greedy)
+Honest comparison
+─────────────────
+  LP ≈ density_greedy   when C1 and C2 are NOT binding (small segments, loose
+                        budget, or all segments fit within budget and caps).
+  LP > density_greedy   when constraints are active — density_greedy violates
+                        at least one of C1 or C2.
 
-For the fractional knapsack the LP optimum equals the greedy optimum only when
-greedy sorts by score/length density — NOT by raw score.  By running linprog
-explicitly we get the provably optimal solution and keep the door open for
-additional operational constraints (per-channel caps, inspection-gap rules,
-safety-floor requirements) without rewriting the solver.
-
-Expected latency : < 1 ms for S ≤ 1 000 segments (HiGHS back-end, CPU).
+Expected latency: < 1 ms for S ≤ 1 000 segments (HiGHS back-end, CPU).
 """
 
 from __future__ import annotations
@@ -84,17 +76,11 @@ def extract_anomaly_candidates(
     Parameters
     ----------
     point_scores : np.ndarray, shape (T,)
-        Point-level anomaly scores (output of window_to_point_scores).
-    threshold : float
-        Score value above which a point is considered anomalous.
+    threshold    : float
 
     Returns
     -------
-    segments : list of dicts, each with keys
-        start  — inclusive start index
-        end    — exclusive end index
-        length — number of time-steps in the segment
-        score  — mean reconstruction error (anomaly signal density)
+    list of dicts — each with keys: start, end, length, score
     """
     segments: list[dict] = []
     in_seg = False
@@ -125,7 +111,7 @@ def extract_anomaly_candidates(
 
 
 # ---------------------------------------------------------------------------
-# Internal metric helper
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 def _compute_triage_metrics(
@@ -133,24 +119,7 @@ def _compute_triage_metrics(
     x: np.ndarray,
     budget_steps: int,
 ) -> dict:
-    """Compute objective, budget usage, and coverage for one triage solution.
-
-    Parameters
-    ----------
-    segments     : list of segment dicts
-    x            : allocation fractions, shape (S,)
-    budget_steps : int  authorised inspection budget
-
-    Returns
-    -------
-    dict with keys:
-        objective              — Σ score_s · x_s  (anomaly signal captured)
-        budget_used            — Σ length_s · x_s  (steps consumed)
-        budget_utilization_pct — budget_used / budget_steps × 100
-        coverage_pct           — objective / total_score × 100
-        n_selected             — segments with x_s > 0.5
-        top_segments           — selected segments sorted by priority desc
-    """
+    """Compute objective, budget usage, and coverage for one triage solution."""
     if not segments:
         return {
             "objective":              0.0,
@@ -191,6 +160,48 @@ def _compute_triage_metrics(
     }
 
 
+def _count_floor_violations(
+    x: np.ndarray,
+    top_k_idx: np.ndarray,
+    floor: float,
+) -> int:
+    """Count priority segments whose allocation falls below the coverage floor."""
+    return int(sum(1 for k in top_k_idx if x[k] < floor - 1e-6))
+
+
+def _density_greedy_fill(
+    scores: np.ndarray,
+    lengths: np.ndarray,
+    budget_steps: int,
+    lb: np.ndarray,
+    ub: np.ndarray,
+) -> np.ndarray:
+    """Density-greedy fill respecting [lb, ub] bounds.
+
+    Used as LP fallback.  Starts from the lower-bound allocations, then fills
+    remaining budget by density (score/length) descending.
+    """
+    n = len(scores)
+    x = lb.copy()
+    remaining = float(budget_steps) - float((lb * lengths).sum())
+    remaining = max(remaining, 0.0)
+
+    density = scores / np.maximum(lengths, 1.0)
+    order   = np.argsort(-density)
+
+    for idx in order:
+        if remaining <= 0.0:
+            break
+        headroom = ub[idx] - x[idx]
+        if headroom <= 1e-9:
+            continue
+        affordable = min(headroom, remaining / max(lengths[idx], 1.0))
+        x[idx]    += affordable
+        remaining -= affordable * lengths[idx]
+
+    return x
+
+
 # ---------------------------------------------------------------------------
 # LP solver
 # ---------------------------------------------------------------------------
@@ -199,92 +210,117 @@ def lp_triage(
     point_scores: np.ndarray,
     threshold: float,
     budget_fraction: float = 0.10,
-) -> tuple[list[dict], np.ndarray]:
-    """LP-optimal anomaly segment selection under an inspection budget.
+    min_coverage_floor: float = 0.50,
+    n_priority: int = 2,
+    per_segment_cap: float = 0.25,
+) -> tuple[list[dict], np.ndarray, bool]:
+    """Constrained LP triage of anomaly segments.
 
-    Solves the fractional knapsack LP via scipy.optimize.linprog (HiGHS):
-      minimise  −score^T x
-      s.t.      length^T x  ≤  budget_steps
-                0 ≤ x_s ≤ 1
+    Solves a fractional knapsack LP with two operational constraints beyond the
+    basic budget limit:
+
+      C1 — Per-segment budget cap  (Constraint 1)
+           length_s · x_s ≤ per_segment_cap · B   for all s
+           No single segment may absorb more than `per_segment_cap` fraction of
+           the total budget.  Modelled as explicit A_ub rows so the constraint
+           matrix is visible to the solver.
+
+      C2 — Minimum coverage floor  (Constraint 2)
+           x_s ≥ min_coverage_floor   for the top-n_priority segments by score
+           High-severity segments must receive at least this inspection fraction,
+           even if they have low anomaly density (score/length ratio).
+
+    These constraints make the problem non-trivially different from unconstrained
+    density-greedy: density_greedy cannot enforce a floor on low-density priority
+    segments and does not inherently cap per-segment consumption.
 
     Parameters
     ----------
-    point_scores    : np.ndarray, shape (T,)
-        Real LSTM-AE point-level reconstruction errors from window_to_point_scores.
-    threshold       : float
-        Deployment threshold (99th pct of training errors).
-    budget_fraction : float, default 0.10
-        Fraction of T available for inspection.
+    point_scores        : np.ndarray, shape (T,)
+    threshold           : float — deployment threshold (99th pct of train errors)
+    budget_fraction     : float — fraction of T to allocate (default 10 %)
+    min_coverage_floor  : float — minimum x_s for top priority segments (default 0.5)
+    n_priority          : int   — how many top-score segments to apply floor to
+    per_segment_cap     : float — max fraction of budget one segment may use (default 0.25)
 
     Returns
     -------
-    segments : list of S dicts (start, end, length, score)
-    x        : np.ndarray, shape (S,), LP-optimal fractions in [0, 1]
+    segments      : list of S dicts (start, end, length, score)
+    x             : np.ndarray shape (S,) — constrained LP-optimal fractions
+    solver_success: bool — True only when HiGHS found the optimum;
+                    False when the fallback density-greedy ran instead
     """
     budget_steps = max(1, int(budget_fraction * len(point_scores)))
-    segments = extract_anomaly_candidates(point_scores, threshold)
+    segments     = extract_anomaly_candidates(point_scores, threshold)
 
     if not segments:
-        return [], np.array([], dtype=np.float64)
+        return [], np.array([], dtype=np.float64), True
 
     n       = len(segments)
     scores  = np.array([seg["score"]  for seg in segments], dtype=np.float64)
     lengths = np.array([seg["length"] for seg in segments], dtype=np.float64)
 
-    # ── scipy.optimize.linprog — HiGHS back-end ─────────────────────────
-    #
-    #   minimise   c^T x
-    #   s.t.       A_ub x  ≤  b_ub      (one budget-constraint row)
-    #              0 ≤ x_s ≤ 1          (bounds per variable)
-    #
-    c    = -scores                          # maximise score ↔ minimise −score
-    A_ub = lengths.reshape(1, -1)           # (1, S)
-    b_ub = np.array([float(budget_steps)])
+    # ── Constraint 2 (C2): minimum coverage floor ──────────────────────────
+    # Apply floor to top-k segments by score.  Reduce k until the floor
+    # requirements alone fit within the budget (otherwise LP is infeasible).
+    k = min(n, n_priority)
+    top_k_idx = np.argsort(-scores)[:k]
+    while k > 0:
+        floor_cost = float(sum(min_coverage_floor * lengths[i] for i in top_k_idx[:k]))
+        if floor_cost <= budget_steps:
+            break
+        k -= 1
+    top_k_idx = top_k_idx[:k]
 
-    result = linprog(c, A_ub=A_ub, b_ub=b_ub,
-                     bounds=[(0.0, 1.0)] * n, method="highs")
+    lb = np.zeros(n, dtype=np.float64)
+    lb[top_k_idx] = min_coverage_floor
+
+    # ── Constraint 1 (C1): per-segment budget cap ───────────────────────────
+    # Upper bound from cap: x_s ≤ cap · B / length_s.
+    cap_steps = float(per_segment_cap) * float(budget_steps)
+    ub = np.minimum(1.0, cap_steps / np.maximum(lengths, 1.0))
+
+    # Ensure lb ≤ ub (if cap forces ub below floor, clamp lb to ub)
+    lb = np.minimum(lb, ub)
+    bounds = list(zip(lb.tolist(), ub.tolist()))
+
+    # ── Constraint matrix ────────────────────────────────────────────────────
+    # Row 0     : total budget   Σ length_s · x_s ≤ B
+    # Rows 1..n : per-seg cap    length_s · x_s   ≤ cap · B   (explicit A_ub rows)
+    A_ub = np.vstack([
+        lengths.reshape(1, -1),   # (1, n)
+        np.diag(lengths),         # (n, n)
+    ])  # shape (n+1, n)
+
+    b_ub = np.concatenate([
+        [float(budget_steps)],
+        np.full(n, cap_steps),
+    ])  # shape (n+1,)
+
+    c = -scores  # maximise signal ↔ minimise −signal
+
+    result = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
 
     if result.success:
-        return segments, result.x
+        x = np.clip(result.x, lb, ub)
+        return segments, x, True
 
-    # Greedy fallback on solver failure (optimal for fractional knapsack)
-    ratio     = scores / np.maximum(lengths, 1.0)
-    order     = np.argsort(-ratio)
-    x         = np.zeros(n, dtype=np.float64)
-    remaining = float(budget_steps)
-    for idx in order:
-        if remaining <= 0.0:
-            break
-        frac      = min(1.0, remaining / lengths[idx])
-        x[idx]    = frac
-        remaining -= frac * lengths[idx]
-
-    return segments, x
+    # ── Fallback: density-greedy respecting bounds ──────────────────────────
+    x = _density_greedy_fill(scores, lengths, budget_steps, lb, ub)
+    return segments, x, False
 
 
 # ---------------------------------------------------------------------------
-# Naive greedy baseline
+# Naive greedy baseline (sort by raw score — deliberately suboptimal)
 # ---------------------------------------------------------------------------
 
 def naive_greedy_triage(segments: list[dict], budget_steps: int) -> np.ndarray:
-    """Naive greedy: sort by raw score, fill budget until exhausted.
+    """Sort by raw score descending; fill until budget exhausted.
 
-    This is the intuitive but suboptimal heuristic.  Sorting by raw score
-    ignores inspection cost (length), so a long segment with a high absolute
-    score can consume the entire budget while shorter, denser segments that
-    would yield more anomaly signal per step go uninspected.
-
-    lp_triage solves the same problem exactly (provably optimal) by letting
-    linprog implicitly rank by score/length density via the LP simplex.
-
-    Parameters
-    ----------
-    segments     : list of dicts from extract_anomaly_candidates
-    budget_steps : int
-
-    Returns
-    -------
-    x : np.ndarray, shape (S,), greedy allocation fractions in [0, 1]
+    This is the intuitive but suboptimal heuristic for fractional knapsack.
+    It ignores score/length density, so a long segment with a high absolute
+    score can consume the entire budget.  It also ignores the operational
+    constraints (floor and cap) entirely.
     """
     if not segments:
         return np.array([], dtype=np.float64)
@@ -293,7 +329,6 @@ def naive_greedy_triage(segments: list[dict], budget_steps: int) -> np.ndarray:
     scores  = np.array([seg["score"]  for seg in segments], dtype=np.float64)
     lengths = np.array([seg["length"] for seg in segments], dtype=np.float64)
 
-    # Sort by raw score descending — naive, ignores cost
     order     = np.argsort(-scores)
     x         = np.zeros(n, dtype=np.float64)
     remaining = float(budget_steps)
@@ -301,7 +336,7 @@ def naive_greedy_triage(segments: list[dict], budget_steps: int) -> np.ndarray:
     for idx in order:
         if remaining <= 0.0:
             break
-        frac      = min(1.0, remaining / lengths[idx])
+        frac      = min(1.0, remaining / max(lengths[idx], 1.0))
         x[idx]    = frac
         remaining -= frac * lengths[idx]
 
@@ -309,83 +344,164 @@ def naive_greedy_triage(segments: list[dict], budget_steps: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# LP vs greedy comparison  (main entry point used by train.py)
+# Density-greedy baseline (optimal for unconstrained fractional knapsack)
+# ---------------------------------------------------------------------------
+
+def density_greedy_triage(
+    segments: list[dict],
+    budget_steps: int,
+    per_segment_cap: float = 0.25,
+) -> np.ndarray:
+    """Sort by score/length density descending; fill until budget exhausted.
+
+    This is the provably optimal algorithm for the UNCONSTRAINED fractional
+    knapsack (Dantzig 1957).  It respects the per-segment cap (C1) but does
+    NOT enforce the minimum-coverage floor (C2) — it has no mechanism to force
+    inspection of low-density high-priority segments.
+
+    When C2 is active, LP will outperform density_greedy because it can
+    re-balance the allocation to satisfy the floor while still spending the
+    remaining budget on high-density segments.
+
+    Parameters
+    ----------
+    segments         : list of dicts from extract_anomaly_candidates
+    budget_steps     : int
+    per_segment_cap  : float — mirrors the LP's C1 cap for a fair comparison
+    """
+    if not segments:
+        return np.array([], dtype=np.float64)
+
+    n       = len(segments)
+    scores  = np.array([seg["score"]  for seg in segments], dtype=np.float64)
+    lengths = np.array([seg["length"] for seg in segments], dtype=np.float64)
+
+    cap_steps = float(per_segment_cap) * float(budget_steps)
+    ub        = np.minimum(1.0, cap_steps / np.maximum(lengths, 1.0))
+    density   = scores / np.maximum(lengths, 1.0)
+    order     = np.argsort(-density)
+
+    x         = np.zeros(n, dtype=np.float64)
+    remaining = float(budget_steps)
+
+    for idx in order:
+        if remaining <= 0.0:
+            break
+        frac      = min(ub[idx], remaining / max(lengths[idx], 1.0))
+        x[idx]    = frac
+        remaining -= frac * lengths[idx]
+
+    return x
+
+
+# ---------------------------------------------------------------------------
+# Three-way comparison  (main entry point used by train.py)
 # ---------------------------------------------------------------------------
 
 def compare_lp_vs_greedy(
     point_scores: np.ndarray,
     threshold: float,
     budget_fraction: float = 0.10,
+    min_coverage_floor: float = 0.50,
+    n_priority: int = 2,
+    per_segment_cap: float = 0.25,
 ) -> dict:
-    """Run LP and naive greedy on real LSTM-AE scores; return full comparison.
+    """Run LP, density-greedy, and naive-greedy on real LSTM-AE scores.
 
-    Takes the actual point-level reconstruction errors from the trained model
-    as input — not synthetic scores.
+    Returns a comparison dict with honest framing:
+      LP ≈ density_greedy   when C1/C2 are not binding
+      LP > density_greedy   when constraints are active
 
     Parameters
     ----------
-    point_scores    : np.ndarray, shape (T,)
-        Real LSTM-AE reconstruction errors from window_to_point_scores.
-    threshold       : float
-        Deployment threshold (99th pct of training errors).
-    budget_fraction : float, default 0.10
+    point_scores        : np.ndarray shape (T,)  — real LSTM-AE reconstruction errors
+    threshold           : float — deployment threshold
+    budget_fraction     : float — default 10 %
+    min_coverage_floor  : float — minimum x_s for top-n_priority segments
+    n_priority          : int   — number of priority segments subject to floor
+    per_segment_cap     : float — max fraction of budget per segment
 
     Returns
     -------
     dict with keys:
-        n_candidates     — number of candidate segments found
-        total_score      — Σ score_s (unconstrained maximum possible objective)
-        budget_steps     — int  (budget in time-steps)
-        budget_fraction  — float
-        lp               — full metric dict for LP solution
-        greedy           — full metric dict for naive greedy solution
-        lp_gain_pct      — (lp_obj − greedy_obj) / greedy_obj × 100
-                           0 when both are equal (they agree when all segments
-                           fit in budget); positive when LP is strictly better
-        lp_is_optimal    — always True: LP solves fractional knapsack exactly
+        n_candidates, total_score, budget_steps, budget_fraction, constraints,
+        lp, density_greedy, naive_greedy,
+        lp_gain_vs_naive_pct, lp_gain_vs_density_pct,
+        lp_is_optimal,
+        naive_floor_violations, density_floor_violations
     """
     budget_steps = max(1, int(budget_fraction * len(point_scores)))
     segments     = extract_anomaly_candidates(point_scores, threshold)
+    total_score  = float(sum(seg["score"] for seg in segments)) if segments else 0.0
 
-    total_score = float(sum(seg["score"] for seg in segments)) if segments else 0.0
+    # Resolve actual k (may be reduced if floor requirements would exceed budget)
+    k = min(len(segments), n_priority)
+    if segments:
+        scores_arr = np.array([s["score"] for s in segments])
+        lengths_arr = np.array([s["length"] for s in segments])
+        top_k_idx  = np.argsort(-scores_arr)[:k]
+        while k > 0:
+            if float(sum(min_coverage_floor * lengths_arr[i] for i in top_k_idx[:k])) <= budget_steps:
+                break
+            k -= 1
+        top_k_idx = top_k_idx[:k]
+    else:
+        top_k_idx = np.array([], dtype=int)
 
-    _, x_lp      = lp_triage(point_scores, threshold, budget_fraction)
-    x_greedy     = naive_greedy_triage(segments, budget_steps)
-
-    lp_metrics     = _compute_triage_metrics(segments, x_lp,     budget_steps)
-    greedy_metrics = _compute_triage_metrics(segments, x_greedy, budget_steps)
-
-    greedy_obj = greedy_metrics["objective"]
-    lp_obj     = lp_metrics["objective"]
-    lp_gain    = (
-        round(100.0 * (lp_obj - greedy_obj) / greedy_obj, 2)
-        if greedy_obj > 0 else 0.0
+    # ── Run all three methods ─────────────────────────────────────────────
+    _, x_lp, solver_success = lp_triage(
+        point_scores, threshold, budget_fraction,
+        min_coverage_floor=min_coverage_floor,
+        n_priority=n_priority,
+        per_segment_cap=per_segment_cap,
     )
+    x_density = density_greedy_triage(segments, budget_steps, per_segment_cap=per_segment_cap)
+    x_naive   = naive_greedy_triage(segments, budget_steps)
+
+    lp_metrics      = _compute_triage_metrics(segments, x_lp,      budget_steps)
+    density_metrics = _compute_triage_metrics(segments, x_density, budget_steps)
+    naive_metrics   = _compute_triage_metrics(segments, x_naive,   budget_steps)
+
+    def _pct_gain(new_val, baseline):
+        if baseline > 1e-9:
+            return round(100.0 * (new_val - baseline) / baseline, 2)
+        return 0.0
+
+    lp_gain_vs_naive   = _pct_gain(lp_metrics["objective"], naive_metrics["objective"])
+    lp_gain_vs_density = _pct_gain(lp_metrics["objective"], density_metrics["objective"])
+
+    naive_floor_viol   = _count_floor_violations(x_naive,   top_k_idx, min_coverage_floor)
+    density_floor_viol = _count_floor_violations(x_density, top_k_idx, min_coverage_floor)
 
     return {
         "n_candidates":    len(segments),
         "total_score":     round(total_score, 4),
         "budget_steps":    budget_steps,
         "budget_fraction": budget_fraction,
+        "constraints": {
+            "min_coverage_floor":    min_coverage_floor,
+            "n_priority_segments":   int(k),
+            "per_segment_cap":       per_segment_cap,
+        },
         "lp":              lp_metrics,
-        "greedy":          greedy_metrics,
-        "lp_gain_pct":     lp_gain,
-        "lp_is_optimal":   True,
+        "density_greedy":  density_metrics,
+        "naive_greedy":    naive_metrics,
+        "lp_gain_vs_naive_pct":   lp_gain_vs_naive,
+        "lp_gain_vs_density_pct": lp_gain_vs_density,
+        "lp_is_optimal":          solver_success,
+        "naive_floor_violations":   naive_floor_viol,
+        "density_floor_violations": density_floor_viol,
     }
 
 
 # ---------------------------------------------------------------------------
-# Legacy summary helper (kept for backward compatibility / existing tests)
+# Legacy helpers (kept for backward compatibility / existing tests)
 # ---------------------------------------------------------------------------
 
 def lp_triage_summary(segments: list[dict], x: np.ndarray) -> dict:
     """Human-readable summary of an LP triage solution.
 
     Kept for backward compatibility — prefer compare_lp_vs_greedy for new code.
-
-    Returns
-    -------
-    dict with keys: n_candidates, n_selected, steps_inspected, top_segments
     """
     if not segments:
         return {
@@ -396,7 +512,6 @@ def lp_triage_summary(segments: list[dict], x: np.ndarray) -> dict:
         }
 
     steps_inspected = float(sum(seg["length"] * xi for seg, xi in zip(segments, x)))
-
     selected = sorted(
         [(seg, float(xi)) for seg, xi in zip(segments, x) if xi > 0.5],
         key=lambda t: -t[1],

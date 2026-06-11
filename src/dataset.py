@@ -27,7 +27,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
 
-WINDOW_SIZE = 128
+WINDOW_SIZE = 30
 
 
 # ---------------------------------------------------------------------------

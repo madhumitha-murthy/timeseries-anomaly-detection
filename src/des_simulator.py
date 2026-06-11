@@ -24,12 +24,21 @@ Full pipeline
          • Machine breakdowns occur inline during service (exponential MTTF/MTTR)
          • Key metrics: makespan, mean/p95 wait time, utilisation, throughput
 
-Key result
-──────────
-When the LP allocates higher fractions to shorter, denser segments, those jobs
-have shorter inspection times and drain the queue faster — reducing mean wait
-time for all high-priority segments compared with the naive greedy schedule,
-which front-loads a long (expensive) segment and forces every other job to wait.
+Methodologically sound comparison
+──────────────────────────────────
+The LP allocation (which segments to inspect, at what fraction) is FIXED.
+compare_des_schedules creates three queue orderings from IDENTICAL job sets:
+
+  • LP ordering      — jobs sorted by LP fraction (density proxy) descending
+                       High-density short jobs first → lower wait time
+  • Naive ordering   — same jobs sorted by raw score descending
+                       Long high-score job may block shorter urgent jobs
+  • Density ordering — same jobs sorted by score/length density descending
+                       Should ≈ LP ordering (confirms LP fractions ≈ density rank)
+
+Because all three orderings share identical inspection_times, makespan and
+utilisation are equal across orderings.  Only wait-time distribution differs.
+This isolates the effect of queue discipline from the allocation decision.
 """
 
 from __future__ import annotations
@@ -343,65 +352,99 @@ def run_inspection_simulation(
 
 def compare_des_schedules(
     segments: list[dict],
-    x_lp: "np.ndarray",      # noqa: F821
-    x_greedy: "np.ndarray",  # noqa: F821
+    x_lp: "np.ndarray",  # noqa: F821
     n_machines: int = 2,
     mttf: float = 0.0,
     mttr: float = 0.0,
     seed: int = 42,
 ) -> dict:
-    """Simulate LP vs greedy inspection schedules and compare operational metrics.
+    """Simulate three queue orderings on IDENTICAL LP-allocated jobs.
 
-    Takes the raw segment list and allocation arrays from lp_triage /
-    naive_greedy_triage, builds priority-ordered job queues, runs a SimPy
-    simulation for each, then returns a comparison dictionary.
+    The LP allocation (x_lp) defines which segments to inspect and their
+    inspection_times.  Three orderings of that SAME job set are simulated:
+
+      lp_order      — sorted by LP fraction descending  (density proxy)
+      naive_order   — sorted by raw anomaly score descending
+      density_order — sorted by score/length density descending
+
+    Because all three share identical inspection_times, makespan and machine
+    utilisation are equal across orderings (same work, same capacity).  Only
+    the wait-time distribution differs — isolating the pure effect of queue
+    dispatch order from the allocation decision.
 
     Parameters
     ----------
     segments   : list of segment dicts (start, end, length, score)
-    x_lp       : np.ndarray, shape (S,) — LP allocation fractions
-    x_greedy   : np.ndarray, shape (S,) — greedy allocation fractions
+    x_lp       : np.ndarray, shape (S,) — LP allocation fractions (defines job set)
     n_machines : int, default 2   — parallel inspection capacity
     mttf       : float, default 0.0 — mean time to failure (0 = no breakdowns)
     mttr       : float, default 0.0 — mean time to repair
-    seed       : int, default 42   — RNG seed (same seed used for both runs)
+    seed       : int, default 42   — RNG seed (identical for all three runs)
 
     Returns
     -------
     dict with keys:
-        lp                       — SimulationResult for the LP schedule
-        greedy                   — SimulationResult for the greedy schedule
-        lp_wait_reduction_pct    — (greedy_wait − lp_wait) / greedy_wait × 100
-                                   Positive means LP reduces mean wait time.
-        lp_makespan_reduction_pct— analogous reduction in makespan
-        n_machines               — int
-        breakdown_enabled        — bool
+        lp            — SimulationResult, LP-fraction ordering
+        greedy        — SimulationResult, raw-score ordering  (naive)
+        density       — SimulationResult, density ordering
+        lp_wait_reduction_pct         — (naive_wait  − lp_wait)      / naive_wait  × 100
+        density_wait_reduction_pct    — (naive_wait  − density_wait) / naive_wait  × 100
+        lp_vs_density_wait_diff_pct   — (density_wait − lp_wait)     / density_wait × 100
+                                        Near 0 confirms LP ≈ density ordering.
+        lp_makespan_reduction_pct     — should be ~0 (same work)
+        n_machines                    — int
+        breakdown_enabled             — bool
     """
-    lp_jobs     = schedule_from_allocation(segments, x_lp,     schedule_name="lp")
-    greedy_jobs = schedule_from_allocation(segments, x_greedy, schedule_name="greedy")
+    # Build the job set from the LP allocation
+    lp_jobs = schedule_from_allocation(segments, x_lp, schedule_name="lp_order")
 
-    lp_result     = run_inspection_simulation(lp_jobs,     n_machines, mttf, mttr, "lp",     seed)
-    greedy_result = run_inspection_simulation(greedy_jobs, n_machines, mttf, mttr, "greedy", seed)
+    if not lp_jobs:
+        empty = run_inspection_simulation([], n_machines, mttf, mttr, "empty", seed)
+        return {
+            "lp":                            empty,
+            "greedy":                        empty,
+            "density":                       empty,
+            "lp_wait_reduction_pct":         0.0,
+            "density_wait_reduction_pct":    0.0,
+            "lp_vs_density_wait_diff_pct":   0.0,
+            "lp_makespan_reduction_pct":     0.0,
+            "n_machines":                    n_machines,
+            "breakdown_enabled":             mttf > 0.0,
+        }
 
-    # Wait-time reduction
-    g_wait = greedy_result.mean_wait_time
-    l_wait = lp_result.mean_wait_time
-    lp_wait_reduction = (
-        round(100.0 * (g_wait - l_wait) / g_wait, 2) if g_wait > 0.0 else 0.0
-    )
+    # ── Naive ordering: same jobs, sorted by raw score descending ──────────
+    naive_jobs = sorted(lp_jobs, key=lambda j: -j.score)
 
-    # Makespan reduction
-    g_make = greedy_result.makespan
-    l_make = lp_result.makespan
-    lp_makespan_reduction = (
-        round(100.0 * (g_make - l_make) / g_make, 2) if g_make > 0.0 else 0.0
-    )
+    # ── Density ordering: same jobs, sorted by score/length density desc ───
+    density_jobs = sorted(lp_jobs, key=lambda j: -(j.score / max(j.length, 1)))
+
+    # ── Run all three simulations with IDENTICAL seed ───────────────────────
+    lp_result      = run_inspection_simulation(lp_jobs,      n_machines, mttf, mttr, "lp_order",      seed)
+    naive_result   = run_inspection_simulation(naive_jobs,   n_machines, mttf, mttr, "naive_order",   seed)
+    density_result = run_inspection_simulation(density_jobs, n_machines, mttf, mttr, "density_order", seed)
+
+    def _wait_reduction(baseline_wait, new_wait):
+        if baseline_wait > 1e-9:
+            return round(100.0 * (baseline_wait - new_wait) / baseline_wait, 2)
+        return 0.0
+
+    def _makespan_reduction(baseline, new):
+        if baseline > 1e-9:
+            return round(100.0 * (baseline - new) / baseline, 2)
+        return 0.0
+
+    naive_wait   = naive_result.mean_wait_time
+    lp_wait      = lp_result.mean_wait_time
+    density_wait = density_result.mean_wait_time
 
     return {
-        "lp":                        lp_result,
-        "greedy":                    greedy_result,
-        "lp_wait_reduction_pct":     lp_wait_reduction,
-        "lp_makespan_reduction_pct": lp_makespan_reduction,
-        "n_machines":                n_machines,
-        "breakdown_enabled":         mttf > 0.0,
+        "lp":      lp_result,
+        "greedy":  naive_result,   # key kept as 'greedy' for backward compatibility
+        "density": density_result,
+        "lp_wait_reduction_pct":        _wait_reduction(naive_wait,   lp_wait),
+        "density_wait_reduction_pct":   _wait_reduction(naive_wait,   density_wait),
+        "lp_vs_density_wait_diff_pct":  _wait_reduction(density_wait, lp_wait),
+        "lp_makespan_reduction_pct":    _makespan_reduction(naive_result.makespan, lp_result.makespan),
+        "n_machines":                   n_machines,
+        "breakdown_enabled":            mttf > 0.0,
     }

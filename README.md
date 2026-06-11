@@ -13,17 +13,17 @@ Semi-supervised time-series anomaly detection using an **LSTM Autoencoder** trai
 ## Results
 
 Evaluated on NASA SMAP channel **E-7** (25 features · 8,310 test steps · 3.4% anomaly rate).
-Early stopping fired at epoch 71 — no overfitting.
+Early stopping fired at epoch 85 — no overfitting.
 
 | Model | F1 | Precision | Recall | AUC-ROC | Avg Precision | False Alarm Rate | Detection Delay |
 |---|---|---|---|---|---|---|---|
-| **LSTM-AE (deployment)** | **0.737** | 0.773 | 0.705 | 0.857 | 0.721 | 0.7% | 22 steps |
-| LSTM-AE (oracle ceiling) | 0.757 | 1.000 | 0.609 | 0.857 | 0.721 | 0.0% | 42 steps |
+| **LSTM-AE (deployment)** | **0.610** | 0.533 | 0.712 | 0.860 | 0.723 | 2.2% | 21 steps |
+| LSTM-AE (oracle ceiling) | 0.765 | 1.000 | 0.619 | 0.860 | 0.723 | 0.0% | 42 steps |
 | Isolation Forest | 0.083 | 0.044 | 0.779 | 0.448 | 0.031 | 59.4% | 0 steps |
 
-> **Deployment threshold** = 99th percentile of training reconstruction errors — no test labels needed.
-> **Oracle threshold** = best F1 sweep over labelled test set — upper bound only, not a real deployment strategy.
-> **False Alarm Rate** = fraction of normal timesteps wrongly flagged. 0.7% means 7 false alerts per 1,000 normal steps.
+> **Deployment threshold** = 99th percentile of training reconstruction errors (5.114) — no test labels needed.
+> **Oracle threshold** = best F1 sweep over labelled test set (7.518) — upper bound only, not a real deployment strategy.
+> **False Alarm Rate** = fraction of normal timesteps wrongly flagged.
 > **Detection Delay** = median steps from anomaly segment start to first detection.
 
 ### Anomaly Detection Plot
@@ -262,51 +262,42 @@ The LP framework makes it trivial to add further operational constraints —
 per-channel caps, minimum inspection gaps, safety-floor score requirements —
 without rewriting the solver.
 
-### LP vs naive greedy
+### Three-way comparison: LP vs density-greedy vs naive-greedy
 
-| | Objective (signal captured) | Budget used | Utilization | Coverage |
-|---|---|---|---|---|
-| **LP `(scipy linprog)`** | **higher** | efficient | near 100 % | **higher** |
-| Naive greedy (sort by score) | lower | may under-use | variable | lower |
+The honest framing:
 
-**Why greedy fails:** it sorts by raw score and ignores cost.  A long segment
-with a high absolute score blocks shorter, denser segments.
+| Method | Role | Floor (C2) respected? | Cap (C1) respected? |
+|---|---|---|---|
+| **LP (HiGHS)** | Provably optimal given C1+C2 | Yes | Yes |
+| Density-greedy | Optimal for *unconstrained* knapsack | No — may skip low-density priority segs | Yes |
+| Naive-greedy | Baseline only — sorts by raw score | No | No |
 
-**Concrete example** (budget = 5 steps):
+**LP = density-greedy when C1/C2 are not binding** (all segments fit in budget, no long segments hit the cap).
+**LP > density-greedy when constraints are active** (a high-priority segment has low density and would be under-allocated by density-greedy).
+
+**Concrete example where floor constraint matters** (budget = 6 steps):
+```
+Segment A : score=3.0, length=10 → density=0.30  (high-priority, low density)
+Segment B : score=2.5, length=2  → density=1.25
+
+floor=0.50 on top-1 → LP forces x_A ≥ 0.50 (5 steps), then gives B 0.5 steps
+density-greedy: picks B fully (2 steps), gives A only 0.40 (< floor — VIOLATED)
+```
+
+### Actual results on E-7 (6 candidate segments, budget=831 steps, total segment length=375 steps)
+
+All 375 steps fit within the 831-step budget, so **all three methods achieve identical
+objective = 51.71 (100 % coverage)**. Constraints are not binding on this channel.
+The LP result is correct and honest: when segments are small, simple greedy suffices.
 
 ```
-Segment A : score = 3.0 · length = 10  →  density = 0.30  ← greedy picks first
-Segment B : score = 2.5 · length =  2  →  density = 1.25  ← LP picks first
+Method                       Objective  Budget used   Util%   Cover%  Floor viol
+LP (constrained, HiGHS)        51.7059      375.0 s   45.1%   100.0%           —
+Density-greedy (C1 only)       51.7059      375.0 s   45.1%   100.0%           0
+Naive-greedy (raw score)       51.7059      375.0 s   45.1%   100.0%           0
 
-Naive greedy : 5/10 of A  → objective = 1.50
-LP (optimal) : all of B + 3/10 of A  → objective = 2.50 + 0.90 = 3.40  (+127 %)
-```
-
-The LP is **provably optimal** for the fractional knapsack — the HiGHS simplex
-finds the exact global optimum, not a heuristic approximation.
-
-### Sample training output
-
-```
-========================================================================
-LP TRIAGE — Anomaly Segment Inspection (LSTM-AE reconstruction errors)
-  Budget : 10% of 8282 test steps = 828 steps
-  Candidate segments : 7
-  Total anomaly score available : 52.3141
-
-                         Objective   Budget used   Utilization   Coverage
-  ----------------------  ----------  -----------  -----------   ---------
-  LP  (scipy linprog)  :    44.8200      826.0 s       99.8 %     85.7 %
-  Greedy (naive)       :    38.1050      712.0 s       86.0 %     72.8 %
-
-  LP gain : +17.6 % more anomaly signal vs naive greedy
-  LP is provably optimal for fractional knapsack.
-
-  Segments selected by LP  (priority > 0.5, sorted desc):
-    1.  steps [ 1210 –  1384]  score=8.2341  priority=1.000
-    2.  steps [ 5022 –  5089]  score=7.1023  priority=1.000
-    3.  steps [ 3401 –  3445]  score=6.4512  priority=1.000
-========================================================================
+LP vs naive-greedy    :  0 % — all segments fit in budget
+LP vs density-greedy  :  ≈0 % — constraints NOT active (equivalent)
 ```
 
 ---

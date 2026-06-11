@@ -36,6 +36,7 @@ from sklearn.metrics import (
 from dataset import get_dataloaders, load_channel, load_labels, train_val_split
 from lp_optimizer import (
     compare_lp_vs_greedy,
+    density_greedy_triage,
     extract_anomaly_candidates,
     lp_triage,
     naive_greedy_triage,
@@ -442,10 +443,12 @@ def plot_loss_curve(train_history, val_history, out_dir):
 # ---------------------------------------------------------------------------
 
 def _print_lp_comparison(cmp: dict, total_steps: int) -> None:
-    """Print the LP vs naive-greedy comparison table to stdout."""
-    W = 72
+    """Print the three-way LP vs density-greedy vs naive-greedy comparison."""
+    W = 84
     lp  = cmp["lp"]
-    gr  = cmp["greedy"]
+    dg  = cmp["density_greedy"]
+    ng  = cmp["naive_greedy"]
+    con = cmp["constraints"]
 
     print("\n" + "=" * W)
     print("LP TRIAGE — Anomaly Segment Inspection (LSTM-AE reconstruction errors)")
@@ -455,27 +458,40 @@ def _print_lp_comparison(cmp: dict, total_steps: int) -> None:
     )
     print(f"  Candidate segments : {cmp['n_candidates']}")
     print(f"  Total anomaly score available : {cmp['total_score']:.4f}")
-    print()
-    print(f"  {'':22s}  {'Objective':>10}  {'Budget used':>11}  "
-          f"{'Utilization':>11}  {'Coverage':>9}")
-    print(f"  {'-'*22}  {'-'*10}  {'-'*11}  {'-'*11}  {'-'*9}")
-    print(f"  {'LP  (scipy linprog)':22s}  {lp['objective']:>10.4f}  "
-          f"{lp['budget_used']:>9.1f} s  "
-          f"{lp['budget_utilization_pct']:>9.1f} %  "
-          f"{lp['coverage_pct']:>7.1f} %")
-    print(f"  {'Greedy (naive)':22s}  {gr['objective']:>10.4f}  "
-          f"{gr['budget_used']:>9.1f} s  "
-          f"{gr['budget_utilization_pct']:>9.1f} %  "
-          f"{gr['coverage_pct']:>7.1f} %")
+    print(f"  Constraints : floor≥{con['min_coverage_floor']:.0%} on top-{con['n_priority_segments']} segments"
+          f"  |  per-segment cap ≤{con['per_segment_cap']:.0%} of budget")
+    print(f"  LP solver succeeded : {cmp['lp_is_optimal']}")
     print()
 
-    if cmp["lp_gain_pct"] > 0:
-        print(
-            f"  LP gain : +{cmp['lp_gain_pct']:.1f} % more anomaly signal vs naive greedy"
-        )
+    hdr = f"  {'Method':<26}  {'Objective':>10}  {'Budget used':>11}  {'Util%':>6}  {'Cover%':>7}  {'Floor viol':>10}"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    print(f"  {'LP (constrained, HiGHS)':<26}  {lp['objective']:>10.4f}  "
+          f"{lp['budget_used']:>9.1f} s  "
+          f"{lp['budget_utilization_pct']:>5.1f}%  "
+          f"{lp['coverage_pct']:>6.1f}%  {'—':>10}")
+    print(f"  {'Density-greedy (C1 only)':<26}  {dg['objective']:>10.4f}  "
+          f"{dg['budget_used']:>9.1f} s  "
+          f"{dg['budget_utilization_pct']:>5.1f}%  "
+          f"{dg['coverage_pct']:>6.1f}%  {cmp['density_floor_violations']:>10}")
+    print(f"  {'Naive-greedy (raw score)':<26}  {ng['objective']:>10.4f}  "
+          f"{ng['budget_used']:>9.1f} s  "
+          f"{ng['budget_utilization_pct']:>5.1f}%  "
+          f"{ng['coverage_pct']:>6.1f}%  {cmp['naive_floor_violations']:>10}")
+    print()
+
+    if cmp["lp_gain_vs_naive_pct"] > 0.01:
+        print(f"  LP vs naive-greedy    : +{cmp['lp_gain_vs_naive_pct']:.2f} % objective gain")
     else:
-        print("  LP gain : 0 % — both methods agree (all segments fit in budget)")
-    print("  LP is provably optimal for fractional knapsack.")
+        print("  LP vs naive-greedy    :  0 % — both methods agree (all segments fit)")
+
+    gain_d = cmp["lp_gain_vs_density_pct"]
+    if abs(gain_d) < 0.1:
+        print("  LP vs density-greedy  :  ≈0 % — constraints NOT active (equivalent)")
+    elif gain_d > 0:
+        print(f"  LP vs density-greedy  : +{gain_d:.2f} % — constraints ARE active (LP needed)")
+    else:
+        print(f"  LP vs density-greedy  :  {gain_d:.2f} % (unexpected; check constraint params)")
 
     if lp["top_segments"]:
         print()
@@ -718,47 +734,55 @@ def main(config: dict = None):
     if_metrics = compute_metrics(if_point_scores, labels_trimmed, if_preds, if_thresh)
 
     # ------------------------------------------------------------------
-    # 5. LP triage — select which predicted anomaly segments to inspect
-    #    given a 10 % inspection budget (fraction of the test period).
-    #    Uses real LSTM-AE reconstruction errors (ae_point_scores).
-    #    Compares LP (provably optimal) vs naive greedy (sort by score).
+    # 5. LP triage — three-way comparison: LP vs density-greedy vs naive.
+    #    Uses real LSTM-AE reconstruction errors and two operational
+    #    constraints: min-coverage floor (C2) and per-segment cap (C1).
+    #    LP ≈ density-greedy when constraints are inactive; LP > density-
+    #    greedy when C1/C2 are binding.
     # ------------------------------------------------------------------
     lp_comparison = compare_lp_vs_greedy(
-        ae_point_scores, deployment_threshold, budget_fraction=0.10
+        ae_point_scores, deployment_threshold, budget_fraction=0.10,
+        min_coverage_floor=0.50, n_priority=2, per_segment_cap=0.25,
     )
     _print_lp_comparison(lp_comparison, scored_length)
 
     # ------------------------------------------------------------------
-    # 5b. DES simulation — quantify operational impact of LP vs greedy
-    #     scheduling on the downstream inspection workflow.
-    #     Calls lp_triage and naive_greedy_triage separately to obtain the
-    #     raw allocation arrays needed by compare_des_schedules.
+    # 5b. DES simulation — fair queue-ordering comparison.
+    #     All three schedules use IDENTICAL LP-allocated jobs (same
+    #     inspection_times); only the dispatch order differs.
+    #     Makespan and utilisation are equal across orderings by
+    #     construction.  Only wait-time distribution differs.
     # ------------------------------------------------------------------
-    budget_steps_des   = max(1, int(0.10 * scored_length))
-    segments_for_des   = extract_anomaly_candidates(ae_point_scores, deployment_threshold)
-    _, x_lp_arr        = lp_triage(ae_point_scores, deployment_threshold, 0.10)
-    x_greedy_arr       = naive_greedy_triage(segments_for_des, budget_steps_des)
+    segments_for_des, x_lp_arr, _ = lp_triage(
+        ae_point_scores, deployment_threshold, 0.10,
+        min_coverage_floor=0.50, n_priority=2, per_segment_cap=0.25,
+    )
 
     des_cmp = compare_des_schedules(
-        segments_for_des, x_lp_arr, x_greedy_arr,
+        segments_for_des, x_lp_arr,
         n_machines=2, mttf=50.0, mttr=5.0, seed=42,
     )
 
-    print("\n" + "=" * 80)
-    print("DES SIMULATION — LP vs Greedy Inspection Schedule")
-    print(f"  Segments: {des_cmp['lp'].n_jobs} LP jobs | {des_cmp['greedy'].n_jobs} greedy jobs")
+    print("\n" + "=" * 84)
+    print("DES SIMULATION — Queue Ordering Comparison (LP vs Naive vs Density)")
+    print("  Allocation: LP (constrained).  All three orderings inspect IDENTICAL jobs.")
     print(f"  Machines: {des_cmp['n_machines']}  |  Breakdowns: {'on (MTTF=50, MTTR=5)' if des_cmp['breakdown_enabled'] else 'off'}")
-    print(f"  {'Metric':<28} {'LP':>12} {'Greedy':>12}")
-    print(f"  {'-'*52}")
-    print(f"  {'Makespan':<28} {des_cmp['lp'].makespan:>12.2f} {des_cmp['greedy'].makespan:>12.2f}")
-    print(f"  {'Mean wait time':<28} {des_cmp['lp'].mean_wait_time:>12.4f} {des_cmp['greedy'].mean_wait_time:>12.4f}")
-    print(f"  {'P95 wait time':<28} {des_cmp['lp'].p95_wait_time:>12.4f} {des_cmp['greedy'].p95_wait_time:>12.4f}")
-    print(f"  {'Machine utilisation':<28} {des_cmp['lp'].machine_utilisation:>12.4f} {des_cmp['greedy'].machine_utilisation:>12.4f}")
-    print(f"  {'Throughput (jobs/t)':<28} {des_cmp['lp'].throughput:>12.4f} {des_cmp['greedy'].throughput:>12.4f}")
-    print(f"  {'Breakdowns':<28} {des_cmp['lp'].breakdown_count:>12} {des_cmp['greedy'].breakdown_count:>12}")
-    print(f"  LP wait reduction  : {des_cmp['lp_wait_reduction_pct']:+.2f} %")
-    print(f"  LP makespan reduction: {des_cmp['lp_makespan_reduction_pct']:+.2f} %")
-    print("=" * 80 + "\n")
+    print(f"  Jobs: {des_cmp['lp'].n_jobs}")
+    print()
+    print(f"  {'Metric':<30} {'LP-order':>12} {'Naive-order':>12} {'Density-order':>14}")
+    print(f"  {'-'*70}")
+    print(f"  {'Makespan':<30} {des_cmp['lp'].makespan:>12.2f} {des_cmp['greedy'].makespan:>12.2f} {des_cmp['density'].makespan:>14.2f}")
+    print(f"  {'Mean wait time':<30} {des_cmp['lp'].mean_wait_time:>12.4f} {des_cmp['greedy'].mean_wait_time:>12.4f} {des_cmp['density'].mean_wait_time:>14.4f}")
+    print(f"  {'P95 wait time':<30} {des_cmp['lp'].p95_wait_time:>12.4f} {des_cmp['greedy'].p95_wait_time:>12.4f} {des_cmp['density'].p95_wait_time:>14.4f}")
+    print(f"  {'Machine utilisation':<30} {des_cmp['lp'].machine_utilisation:>12.4f} {des_cmp['greedy'].machine_utilisation:>12.4f} {des_cmp['density'].machine_utilisation:>14.4f}")
+    print(f"  {'Throughput (jobs/t)':<30} {des_cmp['lp'].throughput:>12.4f} {des_cmp['greedy'].throughput:>12.4f} {des_cmp['density'].throughput:>14.4f}")
+    print(f"  {'Breakdowns':<30} {des_cmp['lp'].breakdown_count:>12} {des_cmp['greedy'].breakdown_count:>12} {des_cmp['density'].breakdown_count:>14}")
+    print()
+    print(f"  LP vs naive   wait reduction : {des_cmp['lp_wait_reduction_pct']:+.2f} %")
+    print(f"  Density vs naive wait reduc. : {des_cmp['density_wait_reduction_pct']:+.2f} %")
+    print(f"  LP vs density wait diff      : {des_cmp['lp_vs_density_wait_diff_pct']:+.2f} %  (≈0 confirms LP ≈ density ordering)")
+    print(f"  LP makespan reduction        : {des_cmp['lp_makespan_reduction_pct']:+.2f} %  (may differ from 0 if breakdowns enabled — ordering affects repair timing)")
+    print("=" * 84 + "\n")
 
     # ------------------------------------------------------------------
     # 6. Print comparison table
@@ -782,6 +806,20 @@ def main(config: dict = None):
     # ------------------------------------------------------------------
     # 7. Save results.json
     # ------------------------------------------------------------------
+    def _simresult_dict(r):
+        return {
+            "schedule_name":        r.schedule_name,
+            "n_jobs":               r.n_jobs,
+            "makespan":             r.makespan,
+            "mean_wait_time":       r.mean_wait_time,
+            "p95_wait_time":        r.p95_wait_time,
+            "mean_inspection_time": r.mean_inspection_time,
+            "machine_utilisation":  r.machine_utilisation,
+            "throughput":           r.throughput,
+            "jobs_completed":       r.jobs_completed,
+            "breakdown_count":      r.breakdown_count,
+        }
+
     results = {
         "channel": cfg["channel"],
         "lstm_ae_deployment": {
@@ -798,36 +836,24 @@ def main(config: dict = None):
         },
         "train_loss_history": metrics_log["train_loss"],
         "val_loss_history":   metrics_log["val_loss"],
-        "lp_triage":          lp_comparison,
+        "lp_triage": lp_comparison,
         "des_simulation": {
-            "n_machines":                des_cmp["n_machines"],
-            "breakdown_enabled":         des_cmp["breakdown_enabled"],
-            "lp_wait_reduction_pct":     des_cmp["lp_wait_reduction_pct"],
-            "lp_makespan_reduction_pct": des_cmp["lp_makespan_reduction_pct"],
-            "lp": {
-                "schedule_name":        des_cmp["lp"].schedule_name,
-                "n_jobs":               des_cmp["lp"].n_jobs,
-                "makespan":             des_cmp["lp"].makespan,
-                "mean_wait_time":       des_cmp["lp"].mean_wait_time,
-                "p95_wait_time":        des_cmp["lp"].p95_wait_time,
-                "mean_inspection_time": des_cmp["lp"].mean_inspection_time,
-                "machine_utilisation":  des_cmp["lp"].machine_utilisation,
-                "throughput":           des_cmp["lp"].throughput,
-                "jobs_completed":       des_cmp["lp"].jobs_completed,
-                "breakdown_count":      des_cmp["lp"].breakdown_count,
-            },
-            "greedy": {
-                "schedule_name":        des_cmp["greedy"].schedule_name,
-                "n_jobs":               des_cmp["greedy"].n_jobs,
-                "makespan":             des_cmp["greedy"].makespan,
-                "mean_wait_time":       des_cmp["greedy"].mean_wait_time,
-                "p95_wait_time":        des_cmp["greedy"].p95_wait_time,
-                "mean_inspection_time": des_cmp["greedy"].mean_inspection_time,
-                "machine_utilisation":  des_cmp["greedy"].machine_utilisation,
-                "throughput":           des_cmp["greedy"].throughput,
-                "jobs_completed":       des_cmp["greedy"].jobs_completed,
-                "breakdown_count":      des_cmp["greedy"].breakdown_count,
-            },
+            "methodology": (
+                "All three orderings use IDENTICAL LP-allocated jobs. "
+                "Makespan and utilisation are equal by construction; "
+                "only wait-time distribution differs."
+            ),
+            "n_machines":                      des_cmp["n_machines"],
+            "breakdown_enabled":               des_cmp["breakdown_enabled"],
+            "mttf":                            50.0,
+            "mttr":                            5.0,
+            "lp_wait_reduction_pct":           des_cmp["lp_wait_reduction_pct"],
+            "density_wait_reduction_pct":      des_cmp["density_wait_reduction_pct"],
+            "lp_vs_density_wait_diff_pct":     des_cmp["lp_vs_density_wait_diff_pct"],
+            "lp_makespan_reduction_pct":       des_cmp["lp_makespan_reduction_pct"],
+            "lp_order":      _simresult_dict(des_cmp["lp"]),
+            "naive_order":   _simresult_dict(des_cmp["greedy"]),
+            "density_order": _simresult_dict(des_cmp["density"]),
         },
     }
     os.makedirs(cfg["out_dir"], exist_ok=True)
